@@ -151,6 +151,7 @@ pub fn parse_lighter_sendtx_ack_envelope(payload: &str) -> Option<LighterSendTxA
         .ok()
         .flatten()
         .or_else(|| u64_field(body, &["timestamp", "ts", "time"]).ok().flatten())
+        .map(normalize_ack_epoch_millis)
         .unwrap_or(0);
 
     Some(LighterSendTxAck {
@@ -198,6 +199,7 @@ fn parse_sendtx_ack_payload(payload: &str) -> Result<ParsedSendTxAck, LighterSen
             message: format!("invalid sendtx timestamp: {e}"),
         })?
         .or_else(|| u64_field(body, &["timestamp", "ts", "time"]).ok().flatten())
+        .map(normalize_ack_epoch_millis)
         .unwrap_or(0);
 
     Ok(ParsedSendTxAck {
@@ -273,6 +275,20 @@ fn normalize_epoch_millis(value: u64) -> u64 {
         value / 1_000
     } else {
         value
+    }
+}
+
+/// Normalises sendTx ack epochs to milliseconds, including second-magnitude
+/// values: the REST/WS ack `timestamp` field is emitted in *seconds*, which
+/// `normalize_epoch_millis` would otherwise pass through as-if-milliseconds
+/// (landing in 1970). Live epochs in ms are always >= 1e12; seconds are ~1e9.
+fn normalize_ack_epoch_millis(value: u64) -> u64 {
+    const SECONDS_MIN: u64 = 1_000_000_000; // 2001-09 in s (10 digits)
+    const MILLIS_MIN: u64 = 1_000_000_000_000; // 2001-09 in ms (13 digits)
+    if (SECONDS_MIN..MILLIS_MIN).contains(&value) {
+        value * 1_000
+    } else {
+        normalize_epoch_millis(value)
     }
 }
 /// Flattens a Lighter `orders`/`trades` payload into individual event objects.

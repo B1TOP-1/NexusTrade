@@ -112,3 +112,24 @@ fn sendtx_error_and_terminal_reason_remain_machine_readable() {
         LighterTerminalClassification::ExchangeReject
     );
 }
+
+#[test]
+fn sendtx_ack_second_epoch_normalizes_to_millis() {
+    // Lighter sendTx ack `timestamp` 为秒级；必须升尺度为毫秒，不得当 ms 直用。
+    let ack = parse_lighter_submit_ack(
+        r#"{"code":200,"data":{"tx_hash":"0xabc"},"timestamp":1781078425}"#,
+        "order-2".to_owned(),
+        Some(102),
+    )
+    .unwrap();
+    assert_eq!(ack.ts_event_ms, 1_781_078_425_000);
+
+    // 已是毫秒级的值必须原样通过。
+    let ack_ms = parse_lighter_submit_ack(
+        r#"{"code":200,"data":{"tx_hash":"0xdef"},"timestamp":1781078425283}"#,
+        "order-3".to_owned(),
+        Some(103),
+    )
+    .unwrap();
+    assert_eq!(ack_ms.ts_event_ms, 1_781_078_425_283);
+}

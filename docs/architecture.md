@@ -69,9 +69,13 @@ NexusTrade/
 │   ├── nexus-risk/               # L1 风控原语：staleness watchdog、kill switch、总敞口闸
 │   ├── nexus-sdk/                # L2 门面 crate：策略唯一依赖。Builder + re-export
 │   ├── nexus-conformance/        # 测试基建：adapter 一致性测试套件 + 订单簿回放夹具
+│   ├── vendor/                   # 实盘验证代码原样保留区：只读，不重构（M1 铁律的物理保障）
+│   │   ├── bybot-hype/           # 原 bybot-hype，逐字迁移
+│   │   ├── bybot-lighter/        # 原 bybot-lighter，逐字迁移
+│   │   └── bybot-market-engine/  # 原 market_engine，逐字迁移
 │   └── venues/
-│       ├── nexus-hype/           # 迁移自 bybot-hype（行情+执行）
-│       ├── nexus-lighter/        # 迁移合并 bybot-lighter（执行）+ market_engine（行情）
+│       ├── nexus-hype/           # 薄 adapter：包装 vendor/bybot-hype 实现三大 trait
+│       ├── nexus-lighter/        # 薄 adapter：包装 vendor/bybot-lighter + market-engine
 │       ├── nexus-binance/        # 规划：含 depth@0ms 增量流
 │       ├── nexus-okx/            # 规划
 │       ├── nexus-bybit/          # 规划

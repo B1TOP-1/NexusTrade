@@ -385,7 +385,7 @@ impl LighterExecutionClient {
                 client_order_index,
                 base_amount,
                 scaled_price,
-                u8::from(request.signed_quantity.is_sign_negative()),
+                side_to_is_ask(request.signed_quantity),
                 map_order_type(request.order_type),
                 time_in_force,
                 u8::from(request.reduce_only),
@@ -779,6 +779,18 @@ async fn reconnect(
 
 fn normalize_symbol(symbol: &str) -> String {
     symbol.trim().to_uppercase()
+}
+
+/// 将带符号数量映射为 Lighter 线协议的 `is_ask` 标志。
+///
+/// Lighter 线协议约定：正数量 = 买入/bid → 0，负数量 = 卖出/ask → 1。
+/// 零数量在 `prepare_order` 入口已被拒绝，不会到达此处。
+const fn side_to_is_ask(signed_quantity: Decimal) -> u8 {
+    if signed_quantity.is_sign_negative() {
+        1
+    } else {
+        0
+    }
 }
 
 const fn map_order_type(order_type: LighterOrderType) -> u8 {

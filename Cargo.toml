@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/nexus-core"]
+members = [
+    "crates/nexus-core",
+    "crates/vendor/bybot-hype",
+    "crates/vendor/bybot-lighter",
+    "crates/vendor/bybot-market-engine",
+    "crates/venues/nexus-hype",
+    "crates/venues/nexus-lighter",
+]
 
 [workspace.package]
 version = "0.1.0"

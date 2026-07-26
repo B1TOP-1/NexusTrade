@@ -1,0 +1,15 @@
+[package]
+name = "nexus-lighter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lighter adapter：包装实盘验证的 bybot-lighter（执行）+ bybot-market-engine（行情），实现 nexus-core 三大 trait。"
+
+[dependencies]
+nexus-core = { path = "../../nexus-core" }
+bybot-lighter = { path = "../../vendor/bybot-lighter" }
+bybot-market-engine = { path = "../../vendor/bybot-market-engine" }
+rust_decimal = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }

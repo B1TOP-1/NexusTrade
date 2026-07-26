@@ -30,3 +30,12 @@ pub use rust_decimal::Decimal;
 
 /// 统一 Result 别名。
 pub type Result<T> = std::result::Result<T, NexusError>;
+
+/// 本地毫秒时间戳（local-E 口径统一入口）。
+pub fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}

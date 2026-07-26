@@ -8,6 +8,8 @@ description = "Hyperliquid adapter：包装实盘验证的 bybot-hype，实现 n
 [dependencies]
 nexus-core = { path = "../../nexus-core" }
 bybot-hype = { path = "../../vendor/bybot-hype", default-features = false, features = ["execution"] }
+hypersdk = "0.2.14"
+anyhow = "1"
 rust_decimal = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }

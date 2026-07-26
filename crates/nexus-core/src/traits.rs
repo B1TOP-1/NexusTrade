@@ -21,6 +21,9 @@ pub struct BookOptions {
     pub dual_feed: bool,
     /// 请求交易所最快增量档位（如 Binance futures depth@0ms）。
     pub fastest: bool,
+    /// 预计算 VWAP 的名义额（USD）。薄 adapter（仅回传固定名义额加权价的
+    /// 数据源）只在 `BookReader::vwap` 传入相同名义额时返回 Some。
+    pub vwap_notional: Option<Decimal>,
 }
 
 impl Default for BookOptions {
@@ -28,6 +31,7 @@ impl Default for BookOptions {
         Self {
             dual_feed: false,
             fastest: true,
+            vwap_notional: None,
         }
     }
 }

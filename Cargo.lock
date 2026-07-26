@@ -3399,8 +3399,10 @@ dependencies = [
 name = "nexus-hype"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bybot-hype",
+ "hypersdk",
  "nexus-core",
  "rust_decimal",
  "thiserror 2.0.19",

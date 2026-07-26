@@ -208,11 +208,17 @@ impl NewOrder {
 }
 
 /// 交易对精度元数据。由 adapter 初始化时从交易所拉取。
+///
+/// 约束字段为 0 表示该所无此约束（如 Hyperliquid 无显式 tick，
+/// Lighter 用 `min_qty` 而非报价名义额下限）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolMeta {
     pub tick_size: Decimal,
     pub lot_size: Decimal,
+    /// 最小报价币名义额（quote notional）。0 = 无约束。
     pub min_notional: Decimal,
+    /// 最小基础币数量（base qty）。0 = 无约束。
+    pub min_qty: Decimal,
 }
 
 impl SymbolMeta {
@@ -235,6 +241,12 @@ impl SymbolMeta {
             return Err(NexusError::InvalidOrder(format!(
                 "qty {} not aligned to lot {}",
                 order.qty, self.lot_size
+            )));
+        }
+        if self.min_qty > Decimal::ZERO && order.qty < self.min_qty {
+            return Err(NexusError::InvalidOrder(format!(
+                "qty {} below minimum {}",
+                order.qty, self.min_qty
             )));
         }
         if let Some(price) = order.price() {
@@ -277,6 +289,7 @@ mod tests {
             tick_size: dec!(0.5),
             lot_size: dec!(0.001),
             min_notional: dec!(10),
+            min_qty: dec!(0.001),
         }
     }
 
@@ -313,8 +326,14 @@ mod tests {
             NewOrder::limit(btc(), Side::Buy, dec!(100.5), dec!(0.001), id.clone());
         assert!(m.validate(&below_notional).is_err());
 
-        let ok = NewOrder::limit(btc(), Side::Buy, dec!(65000.5), dec!(0.001), id);
+        let ok = NewOrder::limit(btc(), Side::Buy, dec!(65000.5), dec!(0.001), id.clone());
         assert!(m.validate(&ok).is_ok());
+
+        // min_qty 约束（base 数量下限）。
+        let mut strict = m.clone();
+        strict.min_qty = dec!(0.002);
+        let below_min_qty = NewOrder::limit(btc(), Side::Buy, dec!(65000.5), dec!(0.001), id);
+        assert!(strict.validate(&below_min_qty).is_err());
     }
 
     #[test]

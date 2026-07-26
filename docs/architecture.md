@@ -208,6 +208,7 @@ pub enum NexusError {
 规则：
 
 1. 每笔订单由 SDK 生成全局唯一 `client_id`，作为全链路幂等键。
+1. **成交可先于 ack 到达**（交易所常见行为）：`InFlight` 允许直接吃 `Fill` 进入 `PartiallyFilled`/`Filled`，迟到的 ack 在 `PartiallyFilled` 上为合法无操作。
 2. `InFlight` 超时（可配，默认 5s）或连接中断 → 强制转 `Unknown`，**SDK 自动触发对账**（REST snapshot 查单），对账结果驱动最终态。
 3. `Unknown` 期间该 symbol 的新单默认被 SDK 拒绝（可配置放行），fail-closed。
 4. 所有状态迁移发出 `OrderUpdate` 事件，策略侧永远看到一致的状态序列，绝不跳变。

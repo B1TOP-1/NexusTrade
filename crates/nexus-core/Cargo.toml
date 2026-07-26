@@ -1,0 +1,16 @@
+[package]
+name = "nexus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NexusTrade L0：统一类型、三大 trait、订单状态机。零 IO，不依赖任何交易所。"
+
+[dependencies]
+rust_decimal = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = { workspace = true }

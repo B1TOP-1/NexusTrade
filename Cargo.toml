@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/nexus-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/b1top/NexusTrade"
+
+[workspace.dependencies]
+rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
+rust_decimal_macros = "1"
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1", default-features = false, features = ["sync", "time", "macros", "rt"] }
+serde = { version = "1", features = ["derive"] }

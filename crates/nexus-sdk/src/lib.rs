@@ -24,3 +24,6 @@ pub use nexus_hype::{HypeMarket, HypeMarketConfig, HypeVenue};
 
 #[cfg(feature = "lighter")]
 pub use nexus_lighter::{LighterMarket, LighterMarketConfig, LighterVenue, LighterVenueConfig};
+
+#[cfg(feature = "binance")]
+pub use nexus_binance::{BinanceMarket, BinanceMarketConfig, BinanceVenue, BinanceVenueConfig};

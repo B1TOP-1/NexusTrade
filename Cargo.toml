@@ -11,6 +11,7 @@ members = [
     "crates/vendor/bybot-market-engine",
     "crates/venues/nexus-hype",
     "crates/venues/nexus-lighter",
+    "crates/venues/nexus-binance",
 ]
 
 [workspace.package]

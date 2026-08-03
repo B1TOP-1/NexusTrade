@@ -2,6 +2,10 @@
 resolver = "2"
 members = [
     "crates/nexus-core",
+    "crates/nexus-book",
+    "crates/nexus-net",
+    "crates/nexus-risk",
+    "crates/nexus-sdk",
     "crates/vendor/bybot-hype",
     "crates/vendor/bybot-lighter",
     "crates/vendor/bybot-market-engine",
@@ -22,3 +26,4 @@ thiserror = "2"
 async-trait = "0.1"
 tokio = { version = "1", default-features = false, features = ["sync", "time", "macros", "rt"] }
 serde = { version = "1", features = ["derive"] }
+hdrhistogram = "7"

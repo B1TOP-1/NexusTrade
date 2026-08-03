@@ -1,0 +1,28 @@
+[package]
+name = "nexus-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NexusTrade L2 门面 crate：策略唯一依赖。Builder + re-export，feature flag 按需启用交易所。"
+
+[features]
+default = ["hype", "lighter"]
+hype = ["dep:nexus-hype"]
+lighter = ["dep:nexus-lighter"]
+
+[dependencies]
+nexus-core = { path = "../nexus-core" }
+nexus-book = { path = "../nexus-book" }
+nexus-net = { path = "../nexus-net" }
+nexus-risk = { path = "../nexus-risk" }
+nexus-hype = { path = "../venues/nexus-hype", optional = true }
+nexus-lighter = { path = "../venues/nexus-lighter", optional = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+rust_decimal = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
+
+[[example]]
+name = "dual_edge"
+required-features = ["hype", "lighter"]

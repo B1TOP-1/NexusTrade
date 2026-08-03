@@ -1,0 +1,14 @@
+[package]
+name = "nexus-book"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NexusTrade L1 本地订单簿引擎：快照+增量、序列校验、arc-swap 无锁读、双轨合并"
+
+[dependencies]
+nexus-core = { path = "../nexus-core" }
+arc-swap = "1"
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = { workspace = true }

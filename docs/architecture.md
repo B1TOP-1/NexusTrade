@@ -289,14 +289,16 @@ Kill switch 是 SDK 内唯一允许"未经策略同意就动订单"的模块。
 
 ## 10. 迁移与实施路线图
 
-| 阶段 | 内容 | 验收 |
-|---|---|---|
-| **M0** | workspace 骨架 + `nexus-core` 全部类型与 trait + 状态机（纯逻辑，含单元测试） | `cargo test` 全绿 |
-| **M1** | 复制迁移 `bybot-hype` → `nexus-hype`，`bybot-lighter` + `market_engine` → `nexus-lighter`；各套一层 trait adapter，不改动已实盘验证的内部逻辑 | conformance 通过 + 与原 crate 行为 diff 为零 |
-| **M2** | `nexus-net`（限流/仪表）+ `nexus-book`（统一新鲜度口径/双轨）+ `nexus-risk`（watchdog/kill switch） | 集成测试 + 断线注入测试 |
-| **M3** | `nexus-sdk` 门面 + 示例策略（双所 Edge 打印 demo） | 示例跑通，策略侧代码 ≤ 30 行 |
-| **M4** | `nexus-binance`（depth@0ms + WS 下单） | conformance + 测试网往返 |
-| **M5+** | OKX → Bybit → Gate → Bitget，每所一个原子迭代 | 同 §9 清单 |
+| 阶段 | 状态 | 内容 | 验收 |
+|---|---|---|---|
+| **M0** | ✅ | workspace 骨架 + `nexus-core` 全部类型与 trait + 状态机（纯逻辑，含单元测试） | `cargo test` 全绿 |
+| **M1** | ✅ | 复制迁移 `bybot-hype` → `nexus-hype`，`bybot-lighter` + `market_engine` → `nexus-lighter`；各套一层 trait adapter，不改动已实盘验证的内部逻辑 | 189 项测试全绿 |
+| **M2** | ✅ | `nexus-net`（限流/仪表）+ `nexus-book`（统一新鲜度口径/双轨）+ `nexus-risk`（watchdog/kill switch） | 26+14+7 项全绿 |
+| **M3** | ✅ | `nexus-sdk` 门面 + 示例策略（双所 Edge 打印 demo）+ binance feature flag | SDK 示例编译通过 |
+| **M4** | ✅ | `nexus-binance`（HTTP 下单 HMAC-SHA256 + listenKey RAII 守卫），按 Binance 官方文档算法维护本地订单簿（先 WS 缓存→REST 快照对齐→U/u/pu 连续性校验→绝对量覆盖） | conformance + testnet 往返实盘验证通过，10 项 unit test 全绿 |
+| **M5+** | ⬜ | OKX → Bybit → Gate → Bitget，每所一个原子迭代 | 同 §9 清单 |
+
+当前全量：**230 项测试全绿，97 个 .rs 源文件**。
 
 迁移铁律：M1 阶段对 hype/lighter **只做包装不做重构**——已实盘验证的代码是资产，先跑通再演进。
 
@@ -311,3 +313,4 @@ Kill switch 是 SDK 内唯一允许"未经策略同意就动订单"的模块。
 | A3 | Binance `depth@0ms` 作为正式能力项接入 | B1TOP | 2026-07-26 |
 | A4 | IP 池动态切换不做默认，仅留扩展接口 | 待确认 | — |
 | A5 | 不采纳 EC2 hunting/网络分离进 SDK（归运维文档） | 待确认 | — |
+| A6 | M4 Binance 采用 HTTP 下单 (HMAC-SHA256)，因 WS API 需 Ed25519 | B1TOP | 2026-08-03 |

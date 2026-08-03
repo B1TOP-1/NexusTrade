@@ -1,0 +1,15 @@
+[package]
+name = "nexus-risk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NexusTrade L1 风控原语：staleness watchdog、kill switch。策略层管赚钱，本层管别亏死。"
+
+[dependencies]
+nexus-core = { path = "../nexus-core" }
+tokio = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+rust_decimal = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

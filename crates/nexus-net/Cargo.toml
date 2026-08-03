@@ -1,0 +1,10 @@
+[package]
+name = "nexus-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NexusTrade L1 连接基建：权重感知令牌桶限流器、HDR 延迟仪表。"
+
+[dependencies]
+nexus-core = { path = "../nexus-core" }
+hdrhistogram = { workspace = true }

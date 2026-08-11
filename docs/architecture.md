@@ -76,7 +76,7 @@ NexusTrade/
 │   └── venues/
 │       ├── nexus-hype/           # 薄 adapter：包装 vendor/bybot-hype 实现三大 trait
 │       ├── nexus-lighter/        # 薄 adapter：包装 vendor/bybot-lighter + market-engine
-│       ├── nexus-binance/        # 规划：含 depth@0ms 增量流
+│       ├── nexus-binance/        # 已实现：行情(depth@0ms/100ms) + WS下单(ws-fapi) + REST + 用户流 + OrderManager
 │       ├── nexus-okx/            # 规划
 │       ├── nexus-bybit/          # 规划
 │       ├── nexus-gate/           # 规划
@@ -166,7 +166,7 @@ pub struct VenueCapabilities {
     pub post_only: bool,
     pub reduce_only: bool,
     pub cancel_all_native: bool,     // 交易所原生一键撤单 vs SDK 逐单模拟
-    pub book_fastest_interval_ms: u32,  // Binance futures = 0 (depth@0ms)
+    pub book_fastest_interval_ms: u32,  // Binance futures = 0 (depth@0ms 实测可用, 尽可能实时)
     pub dual_feed: bool,
 }
 ```
@@ -209,6 +209,17 @@ pub enum NexusError {
    Rejected            Unknown ──reconcile──▶ (Open | Filled | Canceled | Lost)
 ```
 
+撤单路径（CancelPending，2026-08-11 补充）：
+
+```text
+ Open ──cancel请求──▶ CancelPending ──▶ Canceled
+   │                       │
+   │                       └──▶ Filled   （撤单后仍可能成交，如 taker 单）
+ PartiallyFilled ──cancel请求──▶ CancelPending ──▶ Canceled / Filled
+```
+
+⚠ **cancel request 发出 ≠ 已取消**。CancelPending 非终态，撤单请求后仍可能收到 Fill（交易所撮合中）。
+
 规则：
 
 1. 每笔订单由 SDK 生成全局唯一 `client_id`，作为全链路幂等键。
@@ -217,6 +228,8 @@ pub enum NexusError {
 3. `Unknown` 期间该 symbol 的新单默认被 SDK 拒绝（可配置放行），fail-closed。
 4. 所有状态迁移发出 `OrderUpdate` 事件，策略侧永远看到一致的状态序列，绝不跳变。
 5. SDK 不做任何自动重试下单。失败/歧义暴露给策略层决策。
+6. **事件版本号**：`OrderTracker` 维护 `version`，`apply_with_version` 丢弃旧事件（version <= 当前），天然防倒退（如 FILLED 后收到旧 PARTIALLY_FILLED）。
+7. **Order/Execution 分离**：`OrderTracker.executions` 记录每笔成交（qty/price/fee/ts），一笔订单可有多次成交。
 
 ---
 
@@ -281,9 +294,11 @@ Kill switch 是 SDK 内唯一允许"未经策略同意就动订单"的模块。
 
 ### Binance 专项
 
-- 期货订单簿使用 `depth@0ms` 增量流（`book_fastest_interval_ms = 0`）；快照走 REST depth 接口对齐 `lastUpdateId`。
-- 现货评估 SBE 行情流；下单走 WS API（`order.place`）。
-- Trade/aggTrade 流仅接入为特征数据源，不参与订单确认。
+- 期货订单簿使用 `depth@0ms` 增量流（`book_fastest_interval_ms = 0`，实测可用，尽可能实时）；快照走 REST depth 接口对齐 `lastUpdateId`。速度可配（`BINANCE_FUTURES_DEPTH_UPDATE_SPEED` 环境变量，默认 100ms，0ms 为实时推送）。
+- 下单走 **ws-fapi**（`wss://ws-fapi.binance.com/ws-fapi/v1`），HMAC-SHA256 签名（实测可用，无需 Ed25519）。
+- 用户流（listenKey）裸连接（`connect_async` 直连）——实测 `spawn_reader` 的 `connect_with_proxy` 收不到用户流消息。
+- Trade/aggTrade 流仅接入为特征数据源，不参与订单确认；私有成交确认走 `TRADE_LITE` + `ORDER_TRADE_UPDATE`（用户流）。
+- 用户流事件分类：`ORDER_TRADE_UPDATE`（订单+私有成交）、`TRADE_LITE`（最快成交信号）、`ACCOUNT_UPDATE`（余额/仓位）、`MARGIN_CALL`、`ACCOUNT_CONFIG_UPDATE`、`listenKeyExpired`。
 
 ---
 
@@ -295,10 +310,10 @@ Kill switch 是 SDK 内唯一允许"未经策略同意就动订单"的模块。
 | **M1** | ✅ | 复制迁移 `bybot-hype` → `nexus-hype`，`bybot-lighter` + `market_engine` → `nexus-lighter`；各套一层 trait adapter，不改动已实盘验证的内部逻辑 | 189 项测试全绿 |
 | **M2** | ✅ | `nexus-net`（限流/仪表）+ `nexus-book`（统一新鲜度口径/双轨）+ `nexus-risk`（watchdog/kill switch） | 26+14+7 项全绿 |
 | **M3** | ✅ | `nexus-sdk` 门面 + 示例策略（双所 Edge 打印 demo）+ binance feature flag | SDK 示例编译通过 |
-| **M4** | ✅ | `nexus-binance`（HTTP 下单 HMAC-SHA256 + listenKey RAII 守卫），按 Binance 官方文档算法维护本地订单簿（先 WS 缓存→REST 快照对齐→U/u/pu 连续性校验→绝对量覆盖） | conformance + testnet 往返实盘验证通过，10 项 unit test 全绿 |
+| **M4** | ✅ | `nexus-binance`（行情 depth@0ms/100ms + WS 下单 ws-fapi(HMAC) + REST + listenKey 用户流 + OrderManager），本地订单簿按 Binance 官方算法（先 WS 缓存→REST 快照对齐→U/u/pu 连续性校验→绝对量覆盖） | 实测：WS 下单挂单确认 3.42ms、local-E/T 1-3us、滑点 0%、用户流全事件分类处理 |
 | **M5+** | ⬜ | OKX → Bybit → Gate → Bitget，每所一个原子迭代 | 同 §9 清单 |
 
-当前全量：**230 项测试全绿，97 个 .rs 源文件**。
+当前全量：**274 项测试全绿**。
 
 迁移铁律：M1 阶段对 hype/lighter **只做包装不做重构**——已实盘验证的代码是资产，先跑通再演进。
 
@@ -313,4 +328,5 @@ Kill switch 是 SDK 内唯一允许"未经策略同意就动订单"的模块。
 | A3 | Binance `depth@0ms` 作为正式能力项接入 | B1TOP | 2026-07-26 |
 | A4 | IP 池动态切换不做默认，仅留扩展接口 | 待确认 | — |
 | A5 | 不采纳 EC2 hunting/网络分离进 SDK（归运维文档） | 待确认 | — |
-| A6 | M4 Binance 采用 HTTP 下单 (HMAC-SHA256)，因 WS API 需 Ed25519 | B1TOP | 2026-08-03 |
+| A6 | M4 Binance 下单：实测 ws-fapi 支持 HMAC-SHA256（无需 Ed25519），已实现 WS 下单 | B1TOP | 2026-08-03 |
+| A7 | Binance `depth@0ms` 实测可用（非固定 0ms，尽可能实时），接入本地订单簿 | B1TOP | 2026-08-11 |

@@ -485,7 +485,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match v["e"].as_str().unwrap_or("?") {
                         "ORDER_TRADE_UPDATE" => manager_reader.on_order_update(&v),
                         "ACCOUNT_UPDATE" => print_account_update(&v),
-                        "MARGIN_CALL" => println!("  [WS] MARGIN_CALL: {}", v.to_string()),
+                        "ACCOUNT_CONFIG_UPDATE" => {
+                            let ac = &v["ac"];
+                            println!(
+                                "  [WS] ACCOUNT_CONFIG_UPDATE: 杠杆变更={} 多资产={}",
+                                ac["l"].as_str().unwrap_or("?"),
+                                ac["j"].as_bool().unwrap_or(false),
+                            );
+                        }
+                        "MARGIN_CALL" => {
+                            let positions: Vec<String> = v["p"]
+                                .as_array()
+                                .map(|ps| {
+                                    ps.iter()
+                                        .map(|p| {
+                                            p["s"].as_str().unwrap_or("?").to_string()
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            println!(
+                                "  [WS] ⚠ MARGIN_CALL 强平预警: 仓位={:?}",
+                                positions
+                            );
+                        }
                         "listenKeyExpired" => println!("  [WS] ⚠ listenKeyExpired"),
                         _ => println!("  [WS] 其他事件: {}", v.to_string()),
                     }

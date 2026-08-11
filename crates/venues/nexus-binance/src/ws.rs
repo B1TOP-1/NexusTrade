@@ -2,6 +2,7 @@
 //!
 //! 提供连接、心跳、重连、SUBSCRIBE method 发送。
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -13,10 +14,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{client_async_tls_with_config, MaybeTlsStream};
 
-pub(crate) type WsWriteTx = mpsc::UnboundedSender<String>;
+pub type WsWriteTx = mpsc::UnboundedSender<String>;
 
 /// WS 会话句柄：Drop 时 close + abort。
-pub(crate) struct WsSession {
+pub struct WsSession {
     /// fire-and-forget close frame（1000 正常关闭）。
     close_tx: Option<tokio::sync::oneshot::Sender<()>>,
     _task: AbortOnDrop,
@@ -47,17 +48,16 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// 连接到 `url`，持续读取文本帧送入 `tx`。
-///
-/// - 自动回复 Pong。
-/// - 断线时按 `reconnect_delay` 重连（无限）。
-/// - `shutdown_rx` 变为 true 时退出。
-/// - 返回 `(WsSession, WsWriteTx)`：session 管理生命周期，write_tx 发消息。
-pub(crate) async fn spawn_reader(
+/// 发送前回调：在消息真正写入 socket 前触发（用于延迟打点）。
+pub type WireHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// 连接到 `url`，持续读取文本帧送入 `tx`。带发送前 hook 版本。
+pub async fn spawn_reader_with_hook(
     url: &str,
     tx: mpsc::UnboundedSender<String>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     reconnect_delay: Duration,
+    hook: Option<WireHook>,
 ) -> Result<(WsSession, WsWriteTx)> {
     let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
     let (write_tx, mut write_rx) = mpsc::unbounded_channel::<String>();
@@ -118,6 +118,10 @@ pub(crate) async fn spawn_reader(
 
                     to_send = write_rx.recv() => {
                         if let Some(msg) = to_send {
+                            // hook：消息即将写入 socket（网卡推出时刻）
+                            if let Some(h) = &hook {
+                                h(&msg);
+                            }
                             if write.send(Message::Text(msg.into())).await.is_err() {
                                 break;
                             }
@@ -133,6 +137,21 @@ pub(crate) async fn spawn_reader(
     });
 
     Ok((WsSession::new(close_tx, task), write_tx))
+}
+
+/// 连接到 `url`，持续读取文本帧送入 `tx`。
+///
+/// - 自动回复 Pong。
+/// - 断线时按 `reconnect_delay` 重连（无限）。
+/// - `shutdown_rx` 变为 true 时退出。
+/// - 返回 `(WsSession, WsWriteTx)`：session 管理生命周期，write_tx 发消息。
+pub async fn spawn_reader(
+    url: &str,
+    tx: mpsc::UnboundedSender<String>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    reconnect_delay: Duration,
+) -> Result<(WsSession, WsWriteTx)> {
+    spawn_reader_with_hook(url, tx, shutdown_rx, reconnect_delay, None).await
 }
 
 /// 向 WS 发送 SUBSCRIBE 帧。
@@ -207,6 +226,7 @@ async fn connect_with_proxy(
     let port = request.uri().port_u16().unwrap_or(443);
 
     // 1. TCP 连代理
+    eprintln!("[binance-ws] proxy connect to {proxy_addr} for {host}:{port}");
     let mut tcp = match TcpStream::connect(&proxy_addr).await {
         Ok(t) => t,
         Err(e) => return Err(format!("proxy tcp connect: {e}").into()),
@@ -217,21 +237,32 @@ async fn connect_with_proxy(
     tcp.write_all(connect_req.as_bytes()).await?;
     tcp.flush().await?;
 
-    // 3. 读响应头（直到 \r\n\r\n）
+    // 3. 读响应头（直到 \r\n\r\n），带 5s 超时避免卡死。
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     let mut found = false;
-    for _ in 0..(8 * 1024) {
-        match tcp.read(&mut byte).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
-                buf.push(byte[0]);
-                if buf.ends_with(b"\r\n\r\n") {
-                    found = true;
-                    break;
+    let read_deadline = tokio::time::timeout(
+        Duration::from_secs(5),
+        async {
+            for _ in 0..(8 * 1024) {
+                match tcp.read(&mut byte).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        buf.push(byte[0]);
+                        if buf.ends_with(b"\r\n\r\n") {
+                            return true;
+                        }
+                    }
                 }
             }
-        }
+            false
+        },
+    )
+    .await
+    .unwrap_or(false);
+    if !found && read_deadline {
+        // 读到了响应
+        found = true;
     }
     if !found {
         return Err("proxy CONNECT: no response".into());

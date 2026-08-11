@@ -1,31 +1,23 @@
-//! 交易实现性能对比：自研 execution.rs vs binance-futures-rs。
+//! REST vs WS 下单延迟对比（自研实现）。
 //!
-//! 对比维度（真实请求，主网）：
-//!   1. 下单延迟（post-only 远离盘口，不成交）
-//!   2. 撤单延迟
-//!   3. 账户查询延迟
+//! 对比两条下单通道的真实延迟：
+//!   1. REST  : BinanceVenue::place/cancel (POST /fapi/v1/order)
+//!   2. WS    : WsFapiClient::place/cancel (wss://ws-fapi.binance.com)
 //!
-//! 每项跑 N 次取 最小/平均/最大 延迟，用数据决定哪套实现更优。
+//! 每项 N 轮取 min/avg/max，只统计成功请求。post-only 远离盘口，不成交。
 //!
 //! 用法：
-//!   cp .env.example .env   # 填 BINANCE_API_KEY / BINANCE_API_SECRET
-//!   cargo run -p nexus-binance --example bench_exec                    # 3 轮默认
-//!   cargo run -p nexus-binance --example bench_exec -- --rounds 5 --symbol BTCUSDT
-//!   cargo run -p nexus-binance --example bench_exec -- --testnet        # 测试网
-//!
-//! 安全：post-only(GTX) + 价格偏离盘口 0.5% → 永不成交；下单后立即撤单。
+//!   cargo run -p nexus-binance --example bench_exec -- --rounds 5
+//!   cargo run -p nexus-binance --example bench_exec -- --symbol ETHUSDT
+//!   cargo run -p nexus-binance --example bench_exec -- --testnet
 
-use binance_futures_rs::{
-    BinanceClient, CancelOrderRequest, Credentials, NewOrderRequest, OrderSide, OrderType,
-    TimeInForce,
-};
-use nexus_binance::{BinanceVenue, BinanceVenueConfig};
+use std::time::Instant;
+
+use nexus_binance::{BinanceVenue, BinanceVenueConfig, WsFapiClient};
 use nexus_core::{
     ClientOrderId, Decimal, ExecutionVenue, NewOrder, OrderRef, PrivateVenue, Side, Symbol,
 };
 use rust_decimal_macros::dec;
-
-// ── .env 加载 ──
 
 fn load_dotenv() {
     for path in [".env", "../.env", "../../.env"] {
@@ -47,303 +39,190 @@ fn load_dotenv() {
     }
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-// ── 计时工具 ──
-
-struct Latency {
-    min_ms: f64,
-    avg_ms: f64,
-    max_ms: f64,
-}
-
-fn summarize(samples: &[f64]) -> Latency {
-    let min = samples.iter().cloned().fold(f64::MAX, f64::min);
-    let max = samples.iter().cloned().fold(0.0, f64::max);
-    let avg = samples.iter().sum::<f64>() / samples.len() as f64;
-    Latency { min_ms: min, avg_ms: avg, max_ms: max }
-}
-
-fn report(label: &str, samples: &[f64]) {
-    if samples.is_empty() {
-        println!("  → {label}: 无样本（全部失败）");
-        return;
-    }
-    let s = summarize(samples);
-    println!(
-        "  → {label}:  min={:.1}ms avg={:.1}ms max={:.1}ms  (n={})",
-        s.min_ms,
-        s.avg_ms,
-        s.max_ms,
-        samples.len()
-    );
-}
-
-// ── 参考价：post-only 价格计算（全程 Decimal，杜绝 f64 浮点污染）──
-
-/// 从库的 price_ticker 取参考价，价格从字符串解析为 Decimal（不经 f64），
-/// 按最小 tick（0.10）量化。返回 post-only 买价（盘口下方 0.5%，不成交）。
-async fn fetch_reference_prices(client: &BinanceClient, symbol: &str) -> Option<Decimal> {
-    use std::str::FromStr;
-    match client.market().price_ticker(Some(symbol)).await {
-        Ok(tickers) if !tickers.is_empty() => {
-            let price = Decimal::from_str(&tickers[0].price).ok()?;
-            let buy = price * dec!(0.995); // 下方 0.5%
-            Some((buy / dec!(0.10)).round() * dec!(0.10)) // 量化到 0.10 tick
-        }
-        _ => {
-            eprintln!("无法获取 {symbol} 参考价");
-            None
-        }
-    }
-}
-
-// ── 1. 自研 execution.rs ──
-
-async fn bench_self_made(
-    venue: &BinanceVenue,
-    symbol: &str,
+struct Args {
     rounds: usize,
-    buy_price: Decimal,
-) {
-    let sym = Symbol::new(symbol.replace("USDT", ""), "USDT", symbol.to_string());
-
-    let mut place_samples = Vec::new();
-    let mut cancel_samples = Vec::new();
-
-    for i in 0..rounds {
-        let client_id = ClientOrderId(format!("nxb-{}", i));
-        let order = NewOrder::limit(sym.clone(), Side::Buy, buy_price, dec!(0.001), client_id.clone())
-            .post_only();
-
-        let t0 = std::time::Instant::now();
-        let ack = venue.place(order).await;
-        let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
-
-        match ack {
-            Ok(a) => {
-                place_samples.push(elapsed);
-
-                let ref_ = OrderRef {
-                    symbol: sym.clone(),
-                    client_id,
-                    venue_order_id: a.venue_order_id,
-                };
-                let t1 = std::time::Instant::now();
-                match venue.cancel(&ref_).await {
-                    Ok(()) => cancel_samples.push(t1.elapsed().as_secs_f64() * 1000.0),
-                    Err(e) => eprintln!("    [自研] 撤单#{i} FAILED: {e}"),
-                }
-            }
-            Err(e) => eprintln!("    [自研] 下单#{i} FAILED: {e}"),
-        }
-    }
-
-    report("自研下单", &place_samples);
-    report("自研撤单", &cancel_samples);
+    symbol: String,
+    testnet: bool,
 }
 
-// ── 2. binance-futures-rs ──
-
-async fn bench_library(
-    client: &BinanceClient,
-    symbol: &str,
-    rounds: usize,
-    buy_price: f64,
-) {
-    let mut place_samples = Vec::new();
-    let mut cancel_samples = Vec::new();
-
-    for i in 0..rounds {
-        let client_id = format!("nxl-{i}");
-        let order_req = NewOrderRequest::new(symbol.to_string(), OrderSide::Buy, OrderType::Limit)
-            .quantity("0.001".to_string())
-            .price(format!("{buy_price:.2}"))
-            .time_in_force(TimeInForce::Gtx)
-            .client_order_id(client_id.clone());
-
-        let t0 = std::time::Instant::now();
-        let order = client.trading().new_order(order_req).await;
-        let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
-
-        match order {
-            Ok(o) => {
-                place_samples.push(elapsed);
-
-                let cancel_req = CancelOrderRequest::new(symbol.to_string())
-                    .order_id(o.order_id);
-                let t1 = std::time::Instant::now();
-                match client.trading().cancel_order(cancel_req).await {
-                    Ok(_) => cancel_samples.push(t1.elapsed().as_secs_f64() * 1000.0),
-                    Err(e) => eprintln!("    [库] 撤单#{i} FAILED: {e}"),
-                }
-            }
-            Err(e) => eprintln!("    [库] 下单#{i} FAILED: {e}"),
-        }
-    }
-
-    report("库下单", &place_samples);
-    report("库撤单", &cancel_samples);
-}
-
-// ── 账户查询对比（只统计成功请求，失败不计入）──
-
-async fn bench_account(venue: &BinanceVenue, client: &BinanceClient, rounds: usize) {
-    let mut self_samples = Vec::new();
-    let mut lib_samples = Vec::new();
-    let mut self_fail = 0usize;
-    let mut lib_fail = 0usize;
-
-    for i in 0..rounds {
-        let t0 = std::time::Instant::now();
-        match client.account().balance().await {
-            Ok(b) => {
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                lib_samples.push(ms);
-                println!("    [库] 账户查询#{i} {ms:.1}ms 成功 {} 条", b.len());
-            }
-            Err(e) => {
-                lib_fail += 1;
-                println!("    [库] 账户查询#{i} FAILED: {e}");
-            }
-        }
-
-        let t1 = std::time::Instant::now();
-        match venue.snapshot().await {
-            Ok(s) => {
-                let ms = t1.elapsed().as_secs_f64() * 1000.0;
-                self_samples.push(ms);
-                println!(
-                    "    [自研] 账户查询#{i} {ms:.1}ms 成功 持仓={} 余额={}",
-                    s.positions.len(),
-                    s.balances.len()
-                );
-            }
-            Err(e) => {
-                self_fail += 1;
-                println!("    [自研] 账户查询#{i} FAILED: {e}");
-            }
-        }
-    }
-
-    println!(
-        "  （自研成功 {}/{} 失败 {self_fail}；库成功 {}/{rounds} 失败 {lib_fail}）",
-        self_samples.len(),
-        rounds,
-        lib_samples.len()
-    );
-    report("自研账户查询", &self_samples);
-    report("库账户查询", &lib_samples);
-}
-
-// ── main ──
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    load_dotenv();
-
+fn parse_args() -> Args {
+    let mut args = Args {
+        rounds: 5,
+        symbol: "BTCUSDT".to_string(),
+        testnet: false,
+    };
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    let mut rounds = 3usize;
-    let mut symbol = "BTCUSDT".to_string();
-    let mut testnet = false;
     let mut i = 0;
     while i < raw.len() {
         match raw[i].as_str() {
             "--rounds" => {
                 if i + 1 < raw.len() {
-                    rounds = raw[i + 1].parse().unwrap_or(rounds);
+                    args.rounds = raw[i + 1].parse().unwrap_or(args.rounds);
                     i += 1;
                 }
             }
             "--symbol" => {
                 if i + 1 < raw.len() {
-                    symbol = raw[i + 1].to_uppercase();
+                    args.symbol = raw[i + 1].to_uppercase();
                     i += 1;
                 }
             }
-            "--testnet" => testnet = true,
+            "--testnet" => args.testnet = true,
             _ => {}
         }
         i += 1;
     }
+    args
+}
 
-    let (key, secret) = if testnet {
-        (env_or("BINANCE_TESTNET_KEY", ""), env_or("BINANCE_TESTNET_SECRET", ""))
+fn summarize(samples: &[f64]) -> (f64, f64, f64) {
+    if samples.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let min = samples.iter().cloned().fold(f64::MAX, f64::min);
+    let max = samples.iter().cloned().fold(0.0, f64::max);
+    let avg = samples.iter().sum::<f64>() / samples.len() as f64;
+    (min, avg, max)
+}
+
+fn report(label: &str, samples: &[f64]) {
+    if samples.is_empty() {
+        println!("  {label:<24} 无样本（全部失败）");
+        return;
+    }
+    let (min, avg, max) = summarize(samples);
+    println!(
+        "  {label:<24} min={min:>7.2}ms avg={avg:>7.2}ms max={max:>7.2}ms  (n={})",
+        samples.len()
+    );
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    load_dotenv();
+    let args = parse_args();
+
+    let (key, secret) = if args.testnet {
+        (
+            std::env::var("BINANCE_TESTNET_KEY").unwrap_or_default(),
+            std::env::var("BINANCE_TESTNET_SECRET").unwrap_or_default(),
+        )
     } else {
-        (env_or("BINANCE_API_KEY", ""), env_or("BINANCE_API_SECRET", ""))
+        (
+            std::env::var("BINANCE_API_KEY").unwrap_or_default(),
+            std::env::var("BINANCE_API_SECRET").unwrap_or_default(),
+        )
     };
 
     if key.is_empty() || secret.is_empty() {
-        println!("⚠ 未找到 API Key。请创建 .env（cp .env.example .env）并填入 BINANCE_API_KEY / BINANCE_API_SECRET");
+        println!("⚠ 未找到 API Key，请创建 .env");
         return Ok(());
     }
 
     println!("{}", "=".repeat(64));
-    println!("  交易实现性能对比: 自研 execution.rs  vs  binance-futures-rs");
+    println!("  REST vs WS 下单延迟对比（post-only 不成交）");
     println!(
-        "  Symbol: {symbol}  Rounds: {rounds}  Network: {}",
-        if testnet { "TESTNET" } else { "MAINNET" }
+        "  Symbol: {}  Rounds: {}  Network: {}",
+        args.symbol,
+        args.rounds,
+        if args.testnet { "TESTNET" } else { "MAINNET" }
     );
     println!("{}", "=".repeat(64));
 
-    // 库 client（先建，用于取参考价）
-    let client = if testnet {
-        BinanceClient::testnet_with_credentials(Credentials::new(key.clone(), secret.clone()))
-    } else {
-        BinanceClient::new_with_credentials(Credentials::new(key.clone(), secret.clone()))
-    };
-
-    // 取参考价（全程 Decimal，精确到 tick）
-    let Some(buy_price_dec) = fetch_reference_prices(&client, &symbol).await else {
-        println!("无法获取参考价，退出。");
-        return Ok(());
-    };
-    println!(
-        "  参考买价(post-only 0.5% 下方): {buy_price_dec} ({symbol})"
+    // 下单价格（远离盘口，post-only 不会成交）
+    let price = dec!(63600);
+    let sym = Symbol::new(
+        args.symbol.replace("USDT", ""),
+        "USDT",
+        args.symbol.clone(),
     );
 
-    // 自研 venue
-    let config = if testnet {
+    // ── REST 通道 ──
+    let config = if args.testnet {
         BinanceVenueConfig::testnet(key.clone(), secret.clone())
     } else {
         BinanceVenueConfig::mainnet(key.clone(), secret.clone())
     };
-    println!("\n连接自研 venue (需 listenKey)...");
-    let venue = match BinanceVenue::connect(config).await {
-        Ok(v) => Some(v),
-        Err(e) => {
-            println!("  自研 venue 连接失败: {e}");
-            println!("  → 跳过自研测试，只测库。");
-            None
-        }
-    };
+    println!("\n[1] REST 通道 (BinanceVenue::place)");
+    let venue = BinanceVenue::connect(config).await?;
 
-    if let Some(venue) = &venue {
-        println!("\n────────── 1. 账户查询延迟 ({rounds} 轮, 只统计成功) ──────────");
-        bench_account(venue, &client, rounds).await;
+    let mut rest_place = Vec::new();
+    let mut rest_cancel = Vec::new();
+    for i in 0..args.rounds {
+        let order = NewOrder::limit(
+            sym.clone(),
+            Side::Buy,
+            price,
+            dec!(0.001),
+            ClientOrderId(format!("nxr-{}", i)),
+        )
+        .post_only();
 
-        println!("\n────────── 2. 下单 + 撤单延迟 ──────────");
-        println!("  [自研 execution.rs]");
-        bench_self_made(venue, &symbol, rounds, buy_price_dec).await;
-    } else {
-        println!("\n────────── 1. 账户查询延迟 (库) ──────────");
-        let mut lib_samples = Vec::new();
-        for _ in 0..3 {
-            let t0 = std::time::Instant::now();
-            let _ = client.account().balance().await;
-            lib_samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        let t0 = Instant::now();
+        match venue.place(order).await {
+            Ok(ack) => {
+                rest_place.push(t0.elapsed().as_secs_f64() * 1000.0);
+                let ref_ = OrderRef {
+                    symbol: sym.clone(),
+                    client_id: ClientOrderId(format!("nxr-{}", i)),
+                    venue_order_id: ack.venue_order_id,
+                };
+                let t1 = Instant::now();
+                match venue.cancel(&ref_).await {
+                    Ok(()) => rest_cancel.push(t1.elapsed().as_secs_f64() * 1000.0),
+                    Err(e) => println!("    REST 撤单#{i} FAILED: {e}"),
+                }
+            }
+            Err(e) => println!("    REST 下单#{i} FAILED: {e}"),
         }
-        report("库账户查询", &lib_samples);
     }
+    report("REST 下单", &rest_place);
+    report("REST 撤单", &rest_cancel);
 
-    println!("  [binance-futures-rs]");
-    let buy_price_f = buy_price_dec.to_string().parse::<f64>().unwrap_or(0.0);
-    bench_library(&client, &symbol, rounds, buy_price_f).await;
+    // ── WS 通道 ──
+    println!("\n[2] WS 通道 (WsFapiClient::place)");
+    let ws_client = WsFapiClient::connect(key, secret, args.testnet).await?;
 
+    let mut ws_place = Vec::new();
+    let mut ws_cancel = Vec::new();
+    for i in 0..args.rounds {
+        let order = NewOrder::limit(
+            sym.clone(),
+            Side::Buy,
+            price,
+            dec!(0.001),
+            ClientOrderId(format!("nxw-{}", i)),
+        )
+        .post_only();
+
+        let t0 = Instant::now();
+        match ws_client.place(&order).await {
+            Ok(order_id) => {
+                ws_place.push(t0.elapsed().as_secs_f64() * 1000.0);
+                let t1 = Instant::now();
+                match ws_client.cancel(&sym, order_id).await {
+                    Ok(()) => ws_cancel.push(t1.elapsed().as_secs_f64() * 1000.0),
+                    Err(e) => println!("    WS 撤单#{i} FAILED: {e}"),
+                }
+            }
+            Err(e) => println!("    WS 下单#{i} FAILED: {e}"),
+        }
+    }
+    report("WS 下单", &ws_place);
+    report("WS 撤单", &ws_cancel);
+
+    // ── 结论 ──
     println!("\n{}", "=".repeat(64));
-    println!("  结论: 对比上方 min/avg 延迟，取更优者作为交易主实现。");
+    let rest = rest_place.iter().cloned().fold(f64::MAX, f64::min);
+    let ws = ws_place.iter().cloned().fold(f64::MAX, f64::min);
+    if !rest_place.is_empty() && !ws_place.is_empty() {
+        println!("  下单 min:  REST={rest:.2}ms  WS={ws:.2}ms");
+        if ws < rest {
+            println!("  → WS 快 {:.2}ms ({:.1}%)", rest - ws, (rest - ws) / rest * 100.0);
+        } else {
+            println!("  → REST 快 {:.2}ms ({:.1}%)", ws - rest, (ws - rest) / ws * 100.0);
+        }
+    }
     println!("{}", "=".repeat(64));
 
     Ok(())

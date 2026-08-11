@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use nexus_binance::{BinanceVenue, BinanceVenueConfig, WsFapiClient};
 use nexus_core::{
-    ClientOrderId, Decimal, ExecutionVenue, NewOrder, OrderRef, PrivateVenue, Side, Symbol,
+    ClientOrderId, ExecutionVenue, NewOrder, OrderRef, Side, Symbol,
 };
 use rust_decimal_macros::dec;
 
@@ -154,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Side::Buy,
             price,
             dec!(0.001),
-            ClientOrderId(format!("nxr-{}", i)),
+            ClientOrderId(format!("nxr{}", i)),
         )
         .post_only();
 
@@ -164,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rest_place.push(t0.elapsed().as_secs_f64() * 1000.0);
                 let ref_ = OrderRef {
                     symbol: sym.clone(),
-                    client_id: ClientOrderId(format!("nxr-{}", i)),
+                    client_id: ClientOrderId(format!("nxr{}", i)),
                     venue_order_id: ack.venue_order_id,
                 };
                 let t1 = Instant::now();
@@ -191,7 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Side::Buy,
             price,
             dec!(0.001),
-            ClientOrderId(format!("nxw-{}", i)),
+            ClientOrderId(format!("nxw{}", i)),
         )
         .post_only();
 

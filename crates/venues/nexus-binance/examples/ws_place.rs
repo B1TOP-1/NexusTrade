@@ -9,7 +9,7 @@
 //!
 //! 凭据：.env → BINANCE_API_KEY / BINANCE_API_SECRET
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use nexus_binance::WsFapiClient;
 use nexus_core::{ClientOrderId, NewOrder, Side, Symbol};
@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Side::Buy,
         dec!(63600), // 远离盘口，post-only 不会成交
         dec!(0.001),
-        ClientOrderId(format!("nx-ws-{}", chrono::Utc::now().timestamp_millis())),
+        ClientOrderId(format!("nxws{}", chrono::Utc::now().timestamp_millis())),
     )
     .post_only();
 

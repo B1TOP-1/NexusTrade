@@ -19,7 +19,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nexus_binance::auth::sign;
-use nexus_core::{ClientOrderId, NewOrder, Side, Symbol};
+use nexus_binance::{BinanceVenue, BinanceVenueConfig};
+use nexus_core::{
+    ClientOrderId, ExecutionVenue, NewOrder, OrderRef, Side, Symbol,
+};
 use tokio::sync::{mpsc, oneshot};
 use rust_decimal_macros::dec;
 
@@ -342,8 +345,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (user_session, mut user_rx) = connect_user_stream(&key, rest_url).await?;
     println!("    连接成功 ✓");
     let _keep_user = user_session;
-    // 给用户流 WS 留出连接建立时间（直连4s超时→代理CONNECT→TLS，需较长时间）
-    tokio::time::sleep(Duration::from_millis(5000)).await;
+    // 给用户流 WS 留出连接建立时间
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // 连接 REST venue（下单/撤单 REST 通道）
+    println!("[3] 连接 REST venue...");
+    let rest_config = if args.testnet {
+        BinanceVenueConfig::testnet(key.clone(), secret.clone())
+    } else {
+        BinanceVenueConfig::mainnet(key.clone(), secret.clone())
+    };
+    let venue = BinanceVenue::connect(rest_config)
+        .await
+        .map_err(|e| format!("REST venue connect: {e}"))?;
+    println!("    连接成功 ✓");
 
     let sym = Symbol::new(
         args.symbol.replace("USDT", ""),
@@ -352,111 +367,170 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let price = dec!(63600);
 
-    // 统计容器
+    // 统计容器（REST + WS 各一套）
     let mut s = HashMap::<&str, Stats>::new();
     for k in [
-        "策略→网卡",
-        "网卡→ACK",
-        "策略→ACK (RTT)",
-        "ACK→NEW(用户流)",
-        "策略→NEW",
-        "撤单发起→网卡",
-        "网卡→撤单ACK",
-        "撤单ACK→CANCELED",
-        "撤单发起→CANCELED",
+        // 下单链路
+        "WS策略→网卡",
+        "WS网卡→ACK",
+        "WS策略→ACK",
+        "WS策略→NEW",
+        "WS local-E",
+        "WS local-T",
+        "REST策略→ACK",
+        "REST策略→NEW",
+        "REST local-E",
+        "REST local-T",
+        // 撤单链路
+        "WS撤单→网卡",
+        "WS网卡→撤单ACK",
+        "WS发起→CANCELED",
+        "REST撤单→ACK",
+        "REST发起→CANCELED",
     ] {
         s.insert(k, Stats::new());
     }
 
     for i in 0..args.rounds {
         println!("\n────────── 轮次 {i} ──────────");
-        let client_order_id = ClientOrderId(format!("nx-d-{}-{}", args.symbol, i));
-        let order = NewOrder::limit(
+
+        // ═══ WS 通道 ═══
+        println!("  ── WS 通道 ──");
+        let ws_cid = ClientOrderId(format!("nxws{}", i));
+        let ws_order = NewOrder::limit(
             sym.clone(),
             Side::Buy,
             price,
             dec!(0.001),
-            client_order_id.clone(),
+            ws_cid.clone(),
         )
         .post_only();
 
-        // ── 下单链路 ──
-        let t_strategy = Instant::now();
-        let t0 = now_ms();
+        let t_ws_start = Instant::now();
+        let t_ws0 = now_ms();
+        let (ws_resp, ws_wire) = fapi.place(&ws_order).await?;
+        let t_ws_ack = now_ms();
+        let ws_ack_wall = t_ws_start.elapsed().as_secs_f64() * 1000.0;
 
-        let (resp, wire_ts) = fapi.place(&order).await?;
-        let t_ack = now_ms();
-        let t_ack_wall = t_strategy.elapsed().as_secs_f64() * 1000.0;
-
-        // 策略→网卡 = 网卡时刻 - 策略时刻
-        let t_strategy_ms = t0;
-        let local_to_wire = if wire_ts > 0 { wire_ts - t_strategy_ms } else { 0 };
-        // 网卡→ACK = ACK时刻 - 网卡时刻
-        let wire_to_ack = if wire_ts > 0 { t_ack - wire_ts } else { 0 };
-
-        let status = resp["status"].as_i64().unwrap_or(-1);
-        let resp_cid = resp["result"]["clientOrderId"].as_str().unwrap_or("?");
+        let ws_local = if ws_wire > 0 { ws_wire - t_ws0 } else { 0 };
+        let ws_wire_ack = if ws_wire > 0 { t_ws_ack - ws_wire } else { 0 };
+        let ws_status = ws_resp["status"].as_i64().unwrap_or(-1);
         println!(
-            "  下单: status={status} 策略→网卡={local_to_wire}ms 网卡→ACK={wire_to_ack}ms 策略→ACK={t_ack_wall:.2}ms cid_sent={} cid_resp={}",
-            client_order_id.0, resp_cid,
+            "  下单: status={ws_status} 策略→网卡={ws_local}ms 网卡→ACK={ws_wire_ack}ms 策略→ACK={ws_ack_wall:.2}ms"
         );
-
-        if status != 200 {
-            println!("    下单失败: {}", resp["error"]);
-            continue;
-        }
-        let order_id = resp["result"]["orderId"].as_u64().unwrap_or(0);
-
-        push(&mut s, "策略→网卡", local_to_wire as f64);
-        push(&mut s, "网卡→ACK", wire_to_ack as f64);
-        push(&mut s, "策略→ACK (RTT)", t_ack_wall);
-
-        // 等用户流 NEW 确认（匹配 clientOrderId）
-        let t_new = wait_for_order_status(&mut user_rx, &client_order_id.0, &["NEW", "PARTIALLY_FILLED"])
-            .await;
-        if let Some(t_new) = t_new {
-            let ack_to_new = t_new - t_ack;
-            let strategy_to_new = t_new - t0;
-            println!(
-                "  NEW(用户流): ACK→NEW={ack_to_new}ms 策略→NEW={strategy_to_new}ms  (orderId={order_id})"
-            );
-            push(&mut s, "ACK→NEW(用户流)", ack_to_new as f64);
-            push(&mut s, "策略→NEW", strategy_to_new as f64);
+        if ws_status != 200 {
+            println!("    下单失败: {}", ws_resp["error"]);
         } else {
-            println!("  NEW(用户流): 超时未收到");
+            push(&mut s, "WS策略→网卡", ws_local as f64);
+            push(&mut s, "WS网卡→ACK", ws_wire_ack as f64);
+            push(&mut s, "WS策略→ACK", ws_ack_wall);
+
+            let ws_order_id = ws_resp["result"]["orderId"].as_u64().unwrap_or(0);
+            // 用户流 NEW 确认 + local-E/T
+            if let Some(c) = wait_for_order_status(&mut user_rx, &ws_cid.0, &["NEW", "PARTIALLY_FILLED"]).await {
+                let ws_to_new = c.local_recv_ms - t_ws0;
+                let local_e = c.local_recv_ms - c.gateway_ms;
+                let local_t = c.local_recv_ms - c.trade_ms;
+                println!(
+                    "  NEW(用户流): 策略→NEW={ws_to_new}ms local-E={local_e}ms local-T={local_t}ms (status={})",
+                    c.status
+                );
+                push(&mut s, "WS策略→NEW", ws_to_new as f64);
+                push(&mut s, "WS local-E", local_e as f64);
+                push(&mut s, "WS local-T", local_t as f64);
+            } else {
+                println!("  NEW(用户流): 超时未收到");
+            }
+
+            // 撤单
+            let t_c0 = now_ms();
+            let t_cs = Instant::now();
+            let (cresp, c_wire) = fapi.cancel(&args.symbol, ws_order_id).await?;
+            let t_cack = now_ms();
+            let c_local = if c_wire > 0 { c_wire - t_c0 } else { 0 };
+            let c_wack = if c_wire > 0 { t_cack - c_wire } else { 0 };
+            let c_wall = t_cs.elapsed().as_secs_f64() * 1000.0;
+            let cstatus = cresp["status"].as_i64().unwrap_or(-1);
+            println!(
+                "  撤单: status={cstatus} 发起→网卡={c_local}ms 网卡→ACK={c_wack}ms 发起→ACK={c_wall:.2}ms"
+            );
+            if cstatus == 200 {
+                push(&mut s, "WS撤单→网卡", c_local as f64);
+                push(&mut s, "WS网卡→撤单ACK", c_wack as f64);
+                if let Some(cc) = wait_for_order_status(&mut user_rx, &ws_cid.0, &["CANCELED"]).await {
+                    let c0_to_c = cc.local_recv_ms - t_c0;
+                    println!("  CANCELED(用户流): 发起→CANCELED={c0_to_c}ms");
+                    push(&mut s, "WS发起→CANCELED", c0_to_c as f64);
+                } else {
+                    println!("  CANCELED(用户流): 超时未收到");
+                }
+            }
         }
 
-        // ── 撤单链路 ──
-        let t_c0 = now_ms();
-        let t_cancel_start = Instant::now();
-        let (cresp, c_wire) = fapi.cancel(&args.symbol, order_id).await?;
-        let t_cack = now_ms();
-        let t_cack_wall = t_cancel_start.elapsed().as_secs_f64() * 1000.0;
+        // ═══ REST 通道 ═══
+        println!("  ── REST 通道 ──");
+        let rest_cid = ClientOrderId(format!("nxr{}", i));
+        let rest_order = NewOrder::limit(
+            sym.clone(),
+            Side::Buy,
+            price,
+            dec!(0.001),
+            rest_cid.clone(),
+        )
+        .post_only();
 
-        let c_local = if c_wire > 0 { c_wire - t_c0 } else { 0 };
-        let c_wire_to_ack = if c_wire > 0 { t_cack - c_wire } else { 0 };
-        let cstatus = cresp["status"].as_i64().unwrap_or(-1);
-        println!(
-            "  撤单: status={cstatus} 发起→网卡={c_local}ms 网卡→ACK={c_wire_to_ack}ms 发起→ACK={t_cack_wall:.2}ms"
-        );
+        let t_r_start = Instant::now();
+        let t_r0 = now_ms();
+        let rest_ack = venue.place(rest_order).await;
+        let rest_ack_wall = t_r_start.elapsed().as_secs_f64() * 1000.0;
 
-        push(&mut s, "撤单发起→网卡", c_local as f64);
-        push(&mut s, "网卡→撤单ACK", c_wire_to_ack as f64);
-
-        if cstatus == 200 {
-            let t_canceled = wait_for_order_status(&mut user_rx, &client_order_id.0, &["CANCELED"])
-                .await;
-            if let Some(t_canc) = t_canceled {
-                let ack_to_canc = t_canc - t_cack;
-                let c0_to_canc = t_canc - t_c0;
+        match rest_ack {
+            Ok(ack) => {
+                push(&mut s, "REST策略→ACK", rest_ack_wall);
+                let rest_oid = ack.venue_order_id.clone().unwrap_or_default();
                 println!(
-                    "  CANCELED(用户流): ACK→CANCELED={ack_to_canc}ms 发起→CANCELED={c0_to_canc}ms"
+                    "  下单: status=200 策略→ACK={rest_ack_wall:.2}ms orderId={rest_oid}"
                 );
-                push(&mut s, "撤单ACK→CANCELED", ack_to_canc as f64);
-                push(&mut s, "撤单发起→CANCELED", c0_to_canc as f64);
-            } else {
-                println!("  CANCELED(用户流): 超时未收到");
+                // 用户流 NEW 确认 + local-E/T
+                if let Some(c) = wait_for_order_status(&mut user_rx, &rest_cid.0, &["NEW", "PARTIALLY_FILLED"]).await {
+                    let r_to_new = c.local_recv_ms - t_r0;
+                    let local_e = c.local_recv_ms - c.gateway_ms;
+                    let local_t = c.local_recv_ms - c.trade_ms;
+                    println!(
+                        "  NEW(用户流): 策略→NEW={r_to_new}ms local-E={local_e}ms local-T={local_t}ms (status={})",
+                        c.status
+                    );
+                    push(&mut s, "REST策略→NEW", r_to_new as f64);
+                    push(&mut s, "REST local-E", local_e as f64);
+                    push(&mut s, "REST local-T", local_t as f64);
+                } else {
+                    println!("  NEW(用户流): 超时未收到");
+                }
+
+                // 撤单
+                let t_cr = now_ms();
+                let t_crs = Instant::now();
+                let ref_ = OrderRef {
+                    symbol: sym.clone(),
+                    client_id: rest_cid.clone(),
+                    venue_order_id: ack.venue_order_id,
+                };
+                let cancel_r = venue.cancel(&ref_).await;
+                let cr_wall = t_crs.elapsed().as_secs_f64() * 1000.0;
+                let cr_status = if cancel_r.is_ok() { 200 } else { -1 };
+                println!("  撤单: status={cr_status} 发起→ACK={cr_wall:.2}ms");
+                if cancel_r.is_ok() {
+                    push(&mut s, "REST撤单→ACK", cr_wall);
+                    if let Some(cc) = wait_for_order_status(&mut user_rx, &rest_cid.0, &["CANCELED"]).await {
+                        let c0_to_c = cc.local_recv_ms - t_cr;
+                        println!("  CANCELED(用户流): 发起→CANCELED={c0_to_c}ms");
+                        push(&mut s, "REST发起→CANCELED", c0_to_c as f64);
+                    } else {
+                        println!("  CANCELED(用户流): 超时未收到");
+                    }
+                }
             }
+            Err(e) => println!("  下单失败: {e}"),
         }
     }
 
@@ -464,12 +538,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n{}", "=".repeat(72));
     println!("  延迟汇总 (ms, 只统计成功)");
     println!("{}", "=".repeat(72));
-    println!("  ── 下单链路 ──");
-    s["策略→网卡"].report("策略发指令→网卡推出 (本地)");
-    s["网卡→ACK"].report("网卡→币安ACK (网络)");
-    s["策略→ACK (RTT)"].report("策略→币安ACK (总RTT)");
-    s["ACK→NEW(用户流)"].report("币安ACK→用户流NEW");
-    s["策略→NEW"].report("策略→用户流NEW (全链路)");
+    println!("  ── WS 下单链路 ──");
+    s["WS策略→网卡"].report("WS 策略→网卡 (本地)");
+    s["WS网卡→ACK"].report("WS 网卡→币安ACK (网络)");
+    s["WS策略→ACK"].report("WS 策略→ACK (发出)");
+    s["WS策略→NEW"].report("WS 策略→用户流NEW (挂单确认)");
+    s["WS local-E"].report("WS local-E (本地收-E)");
+    s["WS local-T"].report("WS local-T (本地收-T)");
+    println!("  ── REST 下单链路 ──");
+    s["REST策略→ACK"].report("REST 策略→ACK (发出)");
+    s["REST策略→NEW"].report("REST 策略→用户流NEW (挂单确认)");
+    s["REST local-E"].report("REST local-E (本地收-E)");
+    s["REST local-T"].report("REST local-T (本地收-T)");
+    println!("  ── WS 撤单链路 ──");
+    s["WS撤单→网卡"].report("WS 撤单发起→网卡 (本地)");
+    s["WS网卡→撤单ACK"].report("WS 网卡→撤单ACK (网络)");
+    s["WS发起→CANCELED"].report("WS 发起→用户流CANCELED");
+    println!("  ── REST 撤单链路 ──");
+    s["REST撤单→ACK"].report("REST 撤单发起→ACK");
+    s["REST发起→CANCELED"].report("REST 发起→用户流CANCELED");
     println!("  ── 撤单链路 ──");
     s["撤单发起→网卡"].report("撤单发起→网卡推出 (本地)");
     s["网卡→撤单ACK"].report("网卡→撤单ACK (网络)");
@@ -480,13 +567,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 从用户数据流等待指定状态的订单更新。返回收到时刻 (本地 ms)。
-/// 超时 10s 返回 None。
+/// 用户流订单确认结果：含事件时间戳。
+struct StreamConfirm {
+    /// 本地收到时刻（ms epoch）。
+    local_recv_ms: i64,
+    /// 交易所事件时间 E（用户流推送时刻）。
+    gateway_ms: i64,
+    /// 交易所交易时间 T（撮合时刻）。
+    trade_ms: i64,
+    /// 订单状态（NEW/CANCELED 等）。
+    status: String,
+}
+
+/// 从用户数据流等待指定状态的订单更新。
+/// 返回确认信息（含 E/T 时间戳用于 local-E / local-T 计算）。超时返回 None。
 async fn wait_for_order_status(
     user_rx: &mut mpsc::UnboundedReceiver<String>,
     client_order_id: &str,
     statuses: &[&str],
-) -> Option<i64> {
+) -> Option<StreamConfirm> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         let msg = tokio::time::timeout(Duration::from_millis(500), user_rx.recv()).await;
@@ -498,20 +597,18 @@ async fn wait_for_order_status(
         };
         let evt = v["e"].as_str().unwrap_or("?");
         if evt != "ORDER_TRADE_UPDATE" {
-            eprintln!("[user-stream] 非订单事件: e={evt}");
             continue;
         }
         let o = &v["o"];
-        eprintln!(
-            "[user-stream] OTU c={} X={} target={}",
-            o["c"].as_str().unwrap_or("?"),
-            o["X"].as_str().unwrap_or("?"),
-            client_order_id
-        );
         if o["c"].as_str() == Some(client_order_id) {
             let st = o["X"].as_str().unwrap_or("");
             if statuses.contains(&st) {
-                return Some(now_ms());
+                return Some(StreamConfirm {
+                    local_recv_ms: now_ms(),
+                    gateway_ms: v["E"].as_i64().unwrap_or(0),
+                    trade_ms: v["T"].as_i64().unwrap_or(0),
+                    status: st.to_string(),
+                });
             }
         }
     }

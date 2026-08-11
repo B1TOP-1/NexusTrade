@@ -19,7 +19,6 @@ use std::sync::{Arc, Mutex};
 use nexus_core::{NewOrder, NexusError, OrderKind, Result, Symbol, Tif};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::auth::sign;
 use crate::ws;
 
 /// ws-fapi 端点。

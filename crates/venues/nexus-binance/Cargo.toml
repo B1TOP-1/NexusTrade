@@ -42,3 +42,6 @@ path = "examples/ws_place.rs"
 [[example]]
 name = "latency_detail"
 path = "examples/latency_detail.rs"
+[[example]]
+name = "tmp_rest_user"
+path = "examples/tmp_rest_user.rs"

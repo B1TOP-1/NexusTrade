@@ -21,6 +21,10 @@ pub enum OrderState {
     Open,
     /// 部分成交。
     PartiallyFilled,
+    /// 撤单已发出，尚未收到交易所确认。
+    /// ⚠ cancel request 发出 ≠ 已取消。可过渡到 Canceled 或 Filled
+    /// （撤单后仍可能成交，如 taker 单）。
+    CancelPending,
     /// 全部成交（终态）。
     Filled,
     /// 已撤销（终态，可能带部分成交）。
@@ -42,6 +46,24 @@ impl OrderState {
     }
 }
 
+/// 单笔成交（Order/Execution 分离）。
+/// 一笔订单可有多次成交，各自独立记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Execution {
+    /// 成交数量（增量）。
+    pub qty: Decimal,
+    /// 成交价格。
+    pub price: Option<Decimal>,
+    /// 手续费（交易所侧）。
+    pub fee: Decimal,
+    /// 手续费币种。
+    pub fee_asset: Option<String>,
+    /// 交易所成交时间 T（ms epoch）。
+    pub venue_ts_ms: i64,
+    /// 本地接收时间（ms epoch）。
+    pub local_recv_ms: i64,
+}
+
 /// 驱动状态机的事件。由 adapter/SDK 产生，策略侧只读。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderEvent {
@@ -51,8 +73,16 @@ pub enum OrderEvent {
     Acked,
     /// 交易所或本地拒绝。
     Rejected { reason: String },
-    /// 一笔成交（增量数量）。
-    Fill { qty: Decimal },
+    /// 一笔成交（增量数量 + 明细）。
+    Fill {
+        qty: Decimal,
+        price: Option<Decimal>,
+        fee: Option<Decimal>,
+        fee_asset: Option<String>,
+        venue_ts_ms: i64,
+    },
+    /// 撤单请求已发出（等待交易所确认）。
+    CancelSent,
     /// 撤单确认。
     CancelAcked,
     /// 提交后超时未确认。
@@ -94,6 +124,11 @@ pub struct OrderTracker {
     state: OrderState,
     total_qty: Decimal,
     filled_qty: Decimal,
+    /// 事件版本号：每次 apply 递增。旧事件（version <= 当前）直接丢弃，
+    /// 天然防倒退（如 FILLED 后收到旧 PARTIALLY_FILLED）。
+    version: u64,
+    /// 成交记录（Order/Execution 分离）：每笔 Fill 一条。
+    executions: Vec<Execution>,
 }
 
 impl OrderTracker {
@@ -102,6 +137,8 @@ impl OrderTracker {
             state: OrderState::PendingSubmit,
             total_qty,
             filled_qty: Decimal::ZERO,
+            version: 0,
+            executions: Vec::new(),
         }
     }
 
@@ -121,7 +158,26 @@ impl OrderTracker {
         self.state.is_terminal()
     }
 
-    /// 应用事件。非法迁移返回错误且状态不变（调用方决定 fail-closed 动作）。
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn executions(&self) -> &[Execution] {
+        &self.executions
+    }
+
+    /// 应用事件，带版本号。旧事件（version <= 当前）直接丢弃，不改变状态。
+    /// 非法迁移返回错误且状态不变（调用方决定 fail-closed 动作）。
+    pub fn apply_with_version(&mut self, event: OrderEvent, version: u64) -> Result<OrderState, StateError> {
+        // 事件版本去重：旧事件丢弃（FILLED 后收到旧 PARTIALLY_FILLED）
+        if version <= self.version {
+            return Ok(self.state);
+        }
+        self.version = version;
+        self.apply(event)
+    }
+
+    /// 应用事件（自动递增版本号）。
     pub fn apply(&mut self, event: OrderEvent) -> Result<OrderState, StateError> {
         use OrderEvent as E;
         use OrderState as S;
@@ -139,15 +195,23 @@ impl OrderTracker {
             (S::InFlight, E::SubmitTimeout) => S::Unknown,
             (S::InFlight, E::ConnectionLost) => S::Unknown,
             // 成交先于 ack 到达：直接进入成交路径。
-            (S::InFlight, E::Fill { qty }) => self.apply_fill(*qty)?,
+            (S::InFlight, E::Fill { .. }) => self.apply_fill(&event)?,
 
-            (S::Open, E::Fill { qty }) => self.apply_fill(*qty)?,
+            (S::Open, E::Fill { .. }) => self.apply_fill(&event)?,
+            // 撤单请求发出 → CancelPending（非终态，可能仍成交）。
+            (S::Open, E::CancelSent) => S::CancelPending,
             (S::Open, E::CancelAcked) => S::Canceled,
 
-            (S::PartiallyFilled, E::Fill { qty }) => self.apply_fill(*qty)?,
+            (S::PartiallyFilled, E::Fill { .. }) => self.apply_fill(&event)?,
+            (S::PartiallyFilled, E::CancelSent) => S::CancelPending,
             (S::PartiallyFilled, E::CancelAcked) => S::Canceled,
-            // 迟到的 ack（fill 先到场景）：无操作，保持现状。
+            // 迟到 ack（fill 先到场景）：无操作，保持现状。
             (S::PartiallyFilled, E::Acked) => S::PartiallyFilled,
+
+            // CancelPending：撤单后仍可能成交（taker 单），或确认取消。
+            (S::CancelPending, E::Fill { .. }) => self.apply_fill(&event)?,
+            (S::CancelPending, E::CancelAcked) => S::Canceled,
+            (S::CancelPending, E::Rejected { .. }) => S::Rejected,
 
             (S::Unknown, E::Reconciled(outcome)) => self.apply_reconcile(outcome)?,
 
@@ -158,7 +222,17 @@ impl OrderTracker {
         Ok(next)
     }
 
-    fn apply_fill(&mut self, qty: Decimal) -> Result<OrderState, StateError> {
+    fn apply_fill(&mut self, event: &OrderEvent) -> Result<OrderState, StateError> {
+        let (qty, price, fee, fee_asset, venue_ts_ms) = match event {
+            OrderEvent::Fill {
+                qty,
+                price,
+                fee,
+                fee_asset,
+                venue_ts_ms,
+            } => (*qty, *price, *fee, fee_asset.clone(), *venue_ts_ms),
+            _ => unreachable!("apply_fill called with non-fill event"),
+        };
         if qty <= Decimal::ZERO {
             return Err(StateError::NonPositiveFill(qty));
         }
@@ -170,6 +244,15 @@ impl OrderTracker {
             });
         }
         self.filled_qty += qty;
+        // 记录 Execution（Order/Execution 分离）
+        self.executions.push(Execution {
+            qty,
+            price,
+            fee: fee.unwrap_or(Decimal::ZERO),
+            fee_asset,
+            venue_ts_ms,
+            local_recv_ms: crate::now_ms(),
+        });
         Ok(if self.filled_qty == self.total_qty {
             OrderState::Filled
         } else {
@@ -238,11 +321,11 @@ mod tests {
         );
         assert_eq!(t.apply(OrderEvent::Acked).unwrap(), OrderState::Open);
         assert_eq!(
-            t.apply(OrderEvent::Fill { qty: dec!(0.004) }).unwrap(),
+            t.apply(OrderEvent::Fill { qty: dec!(0.004), price: None, fee: None, fee_asset: None, venue_ts_ms: 0 }).unwrap(),
             OrderState::PartiallyFilled
         );
         assert_eq!(
-            t.apply(OrderEvent::Fill { qty: dec!(0.006) }).unwrap(),
+            t.apply(OrderEvent::Fill { qty: dec!(0.006), price: None, fee: None, fee_asset: None, venue_ts_ms: 0 }).unwrap(),
             OrderState::Filled
         );
         assert!(t.is_terminal());
@@ -255,7 +338,7 @@ mod tests {
         let mut t = tracker();
         t.apply(OrderEvent::SubmitSent).unwrap();
         t.apply(OrderEvent::Acked).unwrap();
-        t.apply(OrderEvent::Fill { qty: dec!(0.003) }).unwrap();
+        t.apply(OrderEvent::Fill { qty: dec!(0.003), price: None, fee: None, fee_asset: None, venue_ts_ms: 0 }).unwrap();
         assert_eq!(
             t.apply(OrderEvent::CancelAcked).unwrap(),
             OrderState::Canceled
@@ -283,7 +366,7 @@ mod tests {
         let mut t = tracker();
         t.apply(OrderEvent::SubmitSent).unwrap();
         assert_eq!(
-            t.apply(OrderEvent::Fill { qty: dec!(0.002) }).unwrap(),
+            t.apply(OrderEvent::Fill { qty: dec!(0.002), price: None, fee: None, fee_asset: None, venue_ts_ms: 0 }).unwrap(),
             OrderState::PartiallyFilled
         );
         // 迟到 ack 是合法无操作。
@@ -292,7 +375,7 @@ mod tests {
             OrderState::PartiallyFilled
         );
         assert_eq!(
-            t.apply(OrderEvent::Fill { qty: dec!(0.008) }).unwrap(),
+            t.apply(OrderEvent::Fill { qty: dec!(0.008), price: None, fee: None, fee_asset: None, venue_ts_ms: 0 }).unwrap(),
             OrderState::Filled
         );
     }
@@ -352,8 +435,8 @@ mod tests {
         let mut t = tracker();
         t.apply(OrderEvent::SubmitSent).unwrap();
         t.apply(OrderEvent::Acked).unwrap();
-        t.apply(OrderEvent::Fill { qty: dec!(0.008) }).unwrap();
-        let err = t.apply(OrderEvent::Fill { qty: dec!(0.005) }).unwrap_err();
+        t.apply(OrderEvent::Fill { qty: dec!(0.008), price: None, fee: None, fee_asset: None, venue_ts_ms: 0 }).unwrap();
+        let err = t.apply(OrderEvent::Fill { qty: dec!(0.005), price: None, fee: None, fee_asset: None, venue_ts_ms: 0 }).unwrap_err();
         assert!(matches!(err, StateError::Overfill { .. }));
         assert_eq!(t.state(), OrderState::PartiallyFilled);
         assert_eq!(t.filled_qty(), dec!(0.008));
@@ -363,7 +446,7 @@ mod tests {
     fn invalid_transitions_error_without_mutation() {
         // PendingSubmit 不接受 Fill。
         let mut t = tracker();
-        assert!(t.apply(OrderEvent::Fill { qty: dec!(0.001) }).is_err());
+        assert!(t.apply(OrderEvent::Fill { qty: dec!(0.001), price: None, fee: None, fee_asset: None, venue_ts_ms: 0 }).is_err());
         assert_eq!(t.state(), OrderState::PendingSubmit);
 
         // Open 不接受 SubmitTimeout（超时语义只属于 InFlight）。
@@ -386,7 +469,7 @@ mod tests {
         t.apply(OrderEvent::Rejected { reason: "x".into() })
             .unwrap();
         assert!(t.apply(OrderEvent::Acked).is_err());
-        assert!(t.apply(OrderEvent::Fill { qty: dec!(0.001) }).is_err());
+        assert!(t.apply(OrderEvent::Fill { qty: dec!(0.001), price: None, fee: None, fee_asset: None, venue_ts_ms: 0 }).is_err());
         assert!(t.apply(OrderEvent::CancelAcked).is_err());
     }
 
@@ -396,8 +479,95 @@ mod tests {
         t.apply(OrderEvent::SubmitSent).unwrap();
         t.apply(OrderEvent::Acked).unwrap();
         assert!(matches!(
-            t.apply(OrderEvent::Fill { qty: Decimal::ZERO }),
+            t.apply(OrderEvent::Fill { qty: Decimal::ZERO, price: None, fee: None, fee_asset: None, venue_ts_ms: 0 }),
             Err(StateError::NonPositiveFill(_))
         ));
+    }
+
+    // ═══ 新状态机能力：CancelPending / 版本号 / Execution 分离 ═══
+
+    /// 便捷构造 Fill 事件。
+    fn fill(qty: Decimal) -> OrderEvent {
+        OrderEvent::Fill {
+            qty,
+            price: Some(dec!(100)),
+            fee: Some(dec!(0.01)),
+            fee_asset: Some("USDT".to_string()),
+            venue_ts_ms: 1234,
+        }
+    }
+
+    #[test]
+    fn cancel_pending_then_canceled() {
+        // Open → CancelSent → CancelPending → CancelAcked → Canceled
+        let mut t = tracker();
+        t.apply(OrderEvent::SubmitSent).unwrap();
+        t.apply(OrderEvent::Acked).unwrap();
+        assert_eq!(t.apply(OrderEvent::CancelSent).unwrap(), OrderState::CancelPending);
+        assert_eq!(t.apply(OrderEvent::CancelAcked).unwrap(), OrderState::Canceled);
+        assert!(t.is_terminal());
+    }
+
+    #[test]
+    fn cancel_pending_then_filled() {
+        // 撤单后仍可能成交：PartiallyFilled → CancelPending → Fill → Filled
+        let mut t = tracker();
+        t.apply(OrderEvent::SubmitSent).unwrap();
+        t.apply(OrderEvent::Acked).unwrap();
+        t.apply(fill(dec!(0.004))).unwrap();
+        assert_eq!(t.state(), OrderState::PartiallyFilled);
+        assert_eq!(t.apply(OrderEvent::CancelSent).unwrap(), OrderState::CancelPending);
+        // 撤单请求发出后，剩余 0.006 成交 → Filled
+        assert_eq!(t.apply(fill(dec!(0.006))).unwrap(), OrderState::Filled);
+        assert!(t.is_terminal());
+        assert_eq!(t.filled_qty(), dec!(0.010));
+    }
+
+    #[test]
+    fn cancel_pending_is_not_terminal() {
+        let mut t = tracker();
+        t.apply(OrderEvent::SubmitSent).unwrap();
+        t.apply(OrderEvent::Acked).unwrap();
+        t.apply(OrderEvent::CancelSent).unwrap();
+        assert_eq!(t.state(), OrderState::CancelPending);
+        assert!(!t.is_terminal(), "CancelPending 不是终态");
+        // 还能收 Fill
+        assert_eq!(t.apply(fill(dec!(0.010))).unwrap(), OrderState::Filled);
+    }
+
+    #[test]
+    fn version_dedupe_ignores_old_events() {
+        // FILLED 后收到旧 PARTIALLY_FILLED（低版本）→ 丢弃，不倒退
+        let mut t = tracker();
+        t.apply_with_version(OrderEvent::SubmitSent, 1).unwrap();
+        t.apply_with_version(OrderEvent::Acked, 2).unwrap();
+        t.apply_with_version(fill(dec!(0.006)), 3).unwrap();
+        assert_eq!(t.state(), OrderState::PartiallyFilled);
+        t.apply_with_version(fill(dec!(0.004)), 4).unwrap();
+        assert_eq!(t.state(), OrderState::Filled);
+
+        // 旧事件（version=3 的 PARTIALLY_FILLED）→ 丢弃
+        let st = t.apply_with_version(fill(dec!(0.001)), 3).unwrap();
+        assert_eq!(st, OrderState::Filled);
+        assert_eq!(t.state(), OrderState::Filled);
+        assert_eq!(t.filled_qty(), dec!(0.010));
+        assert_eq!(t.version(), 4);
+    }
+
+    #[test]
+    fn executions_record_each_fill() {
+        // 多次成交各自记录（Order/Execution 分离）
+        let mut t = tracker();
+        t.apply(OrderEvent::SubmitSent).unwrap();
+        t.apply(OrderEvent::Acked).unwrap();
+        t.apply(fill(dec!(0.003))).unwrap();
+        t.apply(fill(dec!(0.007))).unwrap();
+        assert_eq!(t.state(), OrderState::Filled);
+        assert_eq!(t.executions().len(), 2);
+        assert_eq!(t.executions()[0].qty, dec!(0.003));
+        assert_eq!(t.executions()[1].qty, dec!(0.007));
+        assert_eq!(t.executions()[0].fee, dec!(0.01));
+        assert_eq!(t.executions()[0].fee_asset.as_deref(), Some("USDT"));
+        assert_eq!(t.executions()[0].price, Some(dec!(100)));
     }
 }

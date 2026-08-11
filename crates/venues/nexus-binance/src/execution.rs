@@ -505,7 +505,13 @@ fn map_order_update(registry: &Registry, data: &OrderData) -> Vec<AccountEvent> 
             let z = parse_dec(&data.executed_qty).unwrap_or_default();
             let delta = z - entry.tracker.filled_qty();
             if delta > Decimal::ZERO {
-                Some(OrderEvent::Fill { qty: delta })
+                Some(OrderEvent::Fill {
+                    qty: delta,
+                    price: parse_dec(&data.last_filled_price),
+                    fee: parse_dec(&data.commission),
+                    fee_asset: Some(data.commission_asset.clone()),
+                    venue_ts_ms: data.trade_time as i64,
+                })
             } else {
                 None
             }

@@ -332,7 +332,13 @@ fn map_private_event(
                 GatewayOrderStatus::PartiallyFilled | GatewayOrderStatus::Filled
                     if delta > Decimal::ZERO =>
                 {
-                    vec![OrderEvent::Fill { qty: delta }]
+                    vec![OrderEvent::Fill {
+                        qty: delta,
+                        price: None,
+                        fee: None,
+                        fee_asset: None,
+                        venue_ts_ms: 0,
+                    }]
                 }
                 GatewayOrderStatus::Canceled => vec![OrderEvent::CancelAcked],
                 GatewayOrderStatus::Rejected => vec![OrderEvent::Rejected {

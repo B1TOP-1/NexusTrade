@@ -113,6 +113,10 @@ struct OrderState {
     avg_price: Decimal,
     last_fill_qty: Decimal,
     last_fill_price: Decimal,
+    /// 累计手续费。
+    fee: Decimal,
+    /// 手续费币种。
+    fee_asset: String,
     /// 完整状态流转记录。
     transitions: Vec<Transition>,
 }
@@ -127,6 +131,8 @@ impl OrderState {
             avg_price: Decimal::ZERO,
             last_fill_qty: Decimal::ZERO,
             last_fill_price: Decimal::ZERO,
+            fee: Decimal::ZERO,
+            fee_asset: String::new(),
             transitions: Vec::new(),
         }
     }
@@ -162,6 +168,16 @@ impl OrderState {
             .unwrap_or(self.last_fill_qty);
         self.last_fill_price = Decimal::from_str(o["L"].as_str().unwrap_or("0"))
             .unwrap_or(self.last_fill_price);
+
+        // 提取手续费（每次成交增量累加）
+        if let Ok(f) = Decimal::from_str(o["n"].as_str().unwrap_or("0")) {
+            self.fee += f;
+        }
+        if let Some(a) = o["N"].as_str() {
+            if !a.is_empty() {
+                self.fee_asset = a.to_string();
+            }
+        }
     }
 }
 
@@ -169,6 +185,10 @@ impl OrderState {
 struct OrderManager {
     orders: Mutex<HashMap<String, OrderState>>,
     terminal_waiters: Mutex<HashMap<String, tokio::sync::oneshot::Sender<OrderState>>>,
+    /// 最新余额（ACCOUNT_UPDATE 更新）。
+    last_balance: Mutex<Decimal>,
+    /// 最新仓位（带符号：正=多，负=空）。
+    last_position: Mutex<Decimal>,
 }
 
 impl OrderManager {
@@ -176,7 +196,34 @@ impl OrderManager {
         Arc::new(Self {
             orders: Mutex::new(HashMap::new()),
             terminal_waiters: Mutex::new(HashMap::new()),
+            last_balance: Mutex::new(Decimal::ZERO),
+            last_position: Mutex::new(Decimal::ZERO),
         })
+    }
+
+    /// 更新余额/仓位（ACCOUNT_UPDATE）。返回 (余额, 仓位)。
+    fn on_account_update(&self, v: &serde_json::Value) {
+        let a = &v["a"];
+        // 余额（取 USDT 钱包余额）
+        if let Some(bs) = a["B"].as_array() {
+            for b in bs {
+                if b["a"].as_str() == Some("USDT") {
+                    if let Ok(wb) = Decimal::from_str(b["wb"].as_str().unwrap_or("0")) {
+                        *self.last_balance.lock().unwrap() = wb;
+                    }
+                }
+            }
+        }
+        // 仓位（取 BTCUSDT）
+        if let Some(ps) = a["P"].as_array() {
+            for p in ps {
+                if p["s"].as_str() == Some("BTCUSDT") {
+                    if let Ok(pa) = Decimal::from_str(p["pa"].as_str().unwrap_or("0")) {
+                        *self.last_position.lock().unwrap() = pa;
+                    }
+                }
+            }
+        }
     }
 
     /// 注册一个等待终态的 waiter。返回 oneshot receiver。
@@ -189,45 +236,12 @@ impl OrderManager {
         rx
     }
 
-    /// 处理一条 OTU：打印完整推送 + 更新状态，终态时 resolve waiter。
+    /// 处理一条 OTU：更新状态 + 提取 fee，终态时 resolve waiter。
+    /// （不再逐条打印大框——TRADE_LITE 已立即打印成交行，聚合到终态两行）
     fn on_order_update(&self, full: &serde_json::Value) {
         let o = &full["o"];
         let e_ms = full["E"].as_i64().unwrap_or(0);
         let t_ms = full["T"].as_i64().unwrap_or(0);
-
-        // ── 完整 WS 推送打印（每条都显示，不筛选）──
-        println!("");
-        println!("    ╔═ WS ORDER_TRADE_UPDATE ═════════════════════════");
-        println!("    ║ E={} T={}", e_ms, t_ms);
-        println!("    ║ s={} i={} c={}",
-            o["s"].as_str().unwrap_or("?"),
-            o["i"].as_i64().unwrap_or(0),
-            o["c"].as_str().unwrap_or("?"),
-        );
-        println!("    ║ S={} o={} X={} f={}",
-            o["S"].as_str().unwrap_or("?"),
-            o["o"].as_str().unwrap_or("?"),
-            o["X"].as_str().unwrap_or("?"),
-            o["f"].as_str().unwrap_or("?"),
-        );
-        println!("    ║ q={} z={} p={} ap={}",
-            o["q"].as_str().unwrap_or("?"),
-            o["z"].as_str().unwrap_or("?"),
-            o["p"].as_str().unwrap_or("?"),
-            o["ap"].as_str().unwrap_or("?"),
-        );
-        println!("    ║ L={} l={} n={} N={}",
-            o["L"].as_str().unwrap_or("?"),
-            o["l"].as_str().unwrap_or("?"),
-            o["n"].as_str().unwrap_or("?"),
-            o["N"].as_str().unwrap_or("?"),
-        );
-        println!("    ║ m={} R={} T_ts={}",
-            o["m"].as_bool().unwrap_or(false),
-            o["R"].as_str().unwrap_or("?"),
-            o["T"].as_i64().unwrap_or(0),
-        );
-        println!("    ╚══════════════════════════════════════════════════");
 
         let cid = o["c"].as_str().unwrap_or("").to_string();
         if cid.is_empty() {
@@ -263,43 +277,6 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 打印 ACCOUNT_UPDATE（仓位 + 余额）。
-fn print_account_update(v: &serde_json::Value) {
-    let a = &v["a"];
-    let e_ms = v["E"].as_i64().unwrap_or(0);
-    let t_ms = v["T"].as_i64().unwrap_or(0);
-    let reason = a["m"].as_str().unwrap_or("?");
-    println!("");
-    println!("    ╔═ WS ACCOUNT_UPDATE ══════════════════════════");
-    println!("    ║ E={} T={} reason={}", e_ms, t_ms, reason);
-    // 余额变化（调试期全打印）
-    if let Some(bs) = a["B"].as_array() {
-        for b in bs {
-            let asset = b["a"].as_str().unwrap_or("?");
-            let wb = b["wb"].as_str().unwrap_or("?");
-            let cw = b["cw"].as_str().unwrap_or("?");
-            let bc = b["bc"].as_str().unwrap_or("0");
-            println!(
-                "    ║ 余额: {} 钱包={} 可用={} 本次变化={}",
-                asset, wb, cw, bc
-            );
-        }
-    }
-    // 仓位变化（调试期全打印）
-    if let Some(ps) = a["P"].as_array() {
-        for p in ps {
-            let sym = p["s"].as_str().unwrap_or("?");
-            let pa = p["pa"].as_str().unwrap_or("?");
-            let ep = p["ep"].as_str().unwrap_or("?");
-            let up = p["up"].as_str().unwrap_or("?");
-            println!(
-                "    ║ 仓位: {} 数量={} 开仓价={} 未实现盈亏={}",
-                sym, pa, ep, up
-            );
-        }
-    }
-    println!("    ╚══════════════════════════════════════════════════");
-}
 
 fn load_dotenv() {
     for p in [".env", "../.env", "../../.env"] {
@@ -489,21 +466,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match v["e"].as_str().unwrap_or("?") {
                         "ORDER_TRADE_UPDATE" => manager_reader.on_order_update(&v),
                         "TRADE_LITE" => {
-                            // 私有成交轻量版（最快成交信号）
+                            // 私有成交轻量版：立即打印，带本地时间戳（第一行）
+                            let t_local = now_ms();
                             println!(
-                                "  [WS] TRADE_LITE 私有成交: {} {}@{}{} 成交ID={}",
+                                "[{t_local}] 成交 {} {} @ {}{} 成交ID={}",
                                 v["S"].as_str().unwrap_or("?"),
                                 v["l"].as_str().unwrap_or("?"),
                                 v["L"].as_str().unwrap_or("?"),
                                 if v["m"].as_bool().unwrap_or(false) {
-                                    " (被动)"
+                                    " 被动"
                                 } else {
-                                    " (主动)"
+                                    " 主动"
                                 },
                                 v["t"].as_str().unwrap_or("?"),
                             );
                         }
-                        "ACCOUNT_UPDATE" => print_account_update(&v),
+                        "ACCOUNT_UPDATE" => manager_reader.on_account_update(&v),
                         "ACCOUNT_CONFIG_UPDATE" => {
                             let ac = &v["ac"];
                             println!(
@@ -610,36 +588,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let order_local_e = now - final_state.transitions.last().unwrap().gateway_ms;
                         let order_local_t = now - final_state.transitions.last().unwrap().trade_ms;
 
-                        println!(
-                            "  终态确认: {}  策略→FILLED={:.2}ms  [ACK→FILLED={:.2}ms]  local-E={}ms local-T={}ms",
-                            final_state.status.as_str(),
-                            fill_us / 1000.0,
-                            ack_to_fill_us / 1000.0,
-                            order_local_e,
-                            order_local_t,
-                        );
-                        println!(
-                            "  成交: avgPrice={} executedQty={}/{}  lastFill={}@{}{}",
-                            final_state.avg_price,
-                            final_state.executed_qty,
-                            final_state.orig_qty,
-                            final_state.last_fill_qty,
-                            final_state.last_fill_price,
-                            if final_state.status == OrderStatus::Filled { " ✅" } else { "" },
-                        );
-
-                        // 完整状态流转打印
-                        println!("  状态流转:");
-                        for (idx, t) in final_state.transitions.iter().enumerate() {
-                            println!(
-                                "    [{idx}] {} → {}  (T={} E={})",
-                                t.from.as_str(),
-                                t.to.as_str(),
-                                t.trade_ms,
-                                t.gateway_ms,
-                            );
-                        }
-
                         // 滑点
                         let fp = final_state.avg_price;
                         let slippage_pct = if book_side_price > Decimal::ZERO {
@@ -650,9 +598,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         slippages.push(
                             slippage_pct.to_string().parse::<f64>().unwrap_or(0.0),
                         );
+
+                        // ── 两行输出 ──
+                        // 第一行：成交汇总（fee/余额/仓位来自 OrderManager 聚合）
+                        let balance = *manager.last_balance.lock().unwrap();
+                        let position = *manager.last_position.lock().unwrap();
+                        let fee = final_state.fee;
+                        let fee_str = if fee > Decimal::ZERO {
+                            format!(" fee={}{}", fee, final_state.fee_asset)
+                        } else {
+                            String::new()
+                        };
                         println!(
-                            "  滑点: {:.3}% (成交 {fp} vs 簿参考 {book_side_price})",
+                            "[成交] {} {} @ {} 滑点{:.2}%{} 余额={} 仓位={}",
+                            if final_state.status == OrderStatus::Filled { "FILLED" } else { final_state.status.as_str() },
+                            if is_open { "BUY" } else { "SELL" },
+                            final_state.avg_price,
                             slippage_pct,
+                            fee_str,
+                            balance,
+                            position,
+                        );
+
+                        // 第二行：延迟明细
+                        println!(
+                            "  延迟: 策略→ACK={:.2}ms ACK→FILLED={:.2}ms 策略→FILLED={:.2}ms local-E={}ms local-T={}ms",
+                            ack_us / 1000.0,
+                            ack_to_fill_us / 1000.0,
+                            fill_us / 1000.0,
+                            order_local_e,
+                            order_local_t,
                         );
                     }
                     _ => {

@@ -424,7 +424,19 @@ fn map_effect(
                 (e.symbol.clone(), e.side)
             };
             let mut events = Vec::new();
-            if let Some(update) = drive(registry, &id, OrderEvent::Fill { qty }, None, ts_event_ms)
+            if let Some(update) = drive(
+                registry,
+                &id,
+                OrderEvent::Fill {
+                    qty,
+                    price: None,
+                    fee: None,
+                    fee_asset: None,
+                    venue_ts_ms: ts_event_ms as i64,
+                },
+                None,
+                ts_event_ms,
+            )
             {
                 events.push(AccountEvent::OrderUpdate(update));
             }

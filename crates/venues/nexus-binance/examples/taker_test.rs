@@ -121,6 +121,42 @@ async fn wait_fill(
         let o = &v["o"];
         if o["c"].as_str() == Some(cid) {
             let st = o["X"].as_str().unwrap_or("").to_string();
+            // 完整成交明细打印
+            println!(
+                "    [WS成交] 事件e={} E={} T={}",
+                v["e"].as_str().unwrap_or("?"),
+                v["E"].as_i64().unwrap_or(0),
+                v["T"].as_i64().unwrap_or(0)
+            );
+            println!(
+                "            订单 s={} i={} c={} S={} o={} X={}",
+                o["s"].as_str().unwrap_or("?"),
+                o["i"].as_i64().unwrap_or(0),
+                o["c"].as_str().unwrap_or("?"),
+                o["S"].as_str().unwrap_or("?"),
+                o["o"].as_str().unwrap_or("?"),
+                o["X"].as_str().unwrap_or("?"),
+            );
+            println!(
+                "            价格 p={} 原始量 q={} 已成交 z={} 均价 ap={}",
+                o["p"].as_str().unwrap_or("?"),
+                o["q"].as_str().unwrap_or("?"),
+                o["z"].as_str().unwrap_or("?"),
+                o["ap"].as_str().unwrap_or("?"),
+            );
+            println!(
+                "            最新成交价 L={} 最新成交量 l={} 手续费 n={} 币种 N={}",
+                o["L"].as_str().unwrap_or("?"),
+                o["l"].as_str().unwrap_or("?"),
+                o["n"].as_str().unwrap_or("?"),
+                o["N"].as_str().unwrap_or("?"),
+            );
+            println!(
+                "            tif={} 被动成交 m={} reduceOnly={}",
+                o["f"].as_str().unwrap_or("?"),
+                o["m"].as_bool().unwrap_or(false),
+                o["R"].as_str().unwrap_or("?"),
+            );
             if statuses.contains(&st.as_str()) {
                 return Some((
                     v["E"].as_i64().unwrap_or(0),

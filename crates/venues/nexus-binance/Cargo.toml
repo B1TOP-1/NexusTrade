@@ -42,3 +42,7 @@ path = "examples/ws_place.rs"
 [[example]]
 name = "latency_detail"
 path = "examples/latency_detail.rs"
+
+[[example]]
+name = "depth_speed_compare"
+path = "examples/depth_speed_compare.rs"

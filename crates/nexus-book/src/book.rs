@@ -174,6 +174,40 @@ impl BookEngine {
         }
     }
 
+    /// 批量应用两侧增量：bids + asks 共享同一 seq → 只调一次 apply_delta。
+    pub fn apply_delta_both(&self, bids: Vec<Level>, asks: Vec<Level>, seq: u64) -> Result<()> {
+        let old = self.inner.load_full();
+        let mut inner = (*old).clone();
+        if !inner.ready {
+            return Err(NexusError::Stale);
+        }
+        // 合并 bids + asks 到同一个 inner.apply_delta 调用
+        if !bids.is_empty() {
+            let res = inner.apply_delta(Side::Bid, bids, seq);
+            if res.is_err() {
+                // 失败也存储（簿已标记不 ready）
+                self.inner.store(Arc::new(inner));
+                return res;
+            }
+        }
+        if !asks.is_empty() {
+            // 第二个面用同一个 seq，但 inner.apply_delta 检查 self.seq > 0 && seq != self.seq + 1
+            // 此时 after apply_delta 后 self.seq 已是 seq，需要绕过这个检查
+            // 所以还是不能直接复用 apply_delta。
+            // 直接在 inner 上手动操作。
+            for entry in asks {
+                if entry.qty.is_zero() {
+                    remove_level(&mut inner.asks, entry.price);
+                } else {
+                    upsert_level(&mut inner.asks, entry.price, entry.qty, false);
+                }
+            }
+            inner.last_update_ms = now_ms();
+        }
+        self.inner.store(Arc::new(inner));
+        Ok(())
+    }
+
     pub fn handle(&self) -> BookHandle {
         BookHandle {
             inner: Arc::clone(&self.inner),

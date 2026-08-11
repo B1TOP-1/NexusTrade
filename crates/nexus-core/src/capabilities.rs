@@ -12,7 +12,7 @@ pub struct VenueCapabilities {
     pub reduce_only: bool,
     /// 交易所原生一键撤单；false 时 SDK 逐单模拟 cancel_all。
     pub cancel_all_native: bool,
-    /// 最快增量盘口档位（毫秒）。Binance futures depth@0ms = 0。
+    /// 最快增量盘口档位（毫秒）。Binance futures = 100ms。
     pub book_fastest_interval_ms: u32,
     /// 支持双轨订阅（P7）。
     pub dual_feed: bool,

@@ -19,7 +19,7 @@ use crate::Result;
 pub struct BookOptions {
     /// 双轨订阅（P7）：两条 WS 按序列号去重互补。
     pub dual_feed: bool,
-    /// 请求交易所最快增量档位（如 Binance futures depth@0ms）。
+    /// 请求交易所最快增量档位（如 Binance futures @100ms）。
     pub fastest: bool,
     /// 预计算 VWAP 的名义额（USD）。薄 adapter（仅回传固定名义额加权价的
     /// 数据源）只在 `BookReader::vwap` 传入相同名义额时返回 Some。

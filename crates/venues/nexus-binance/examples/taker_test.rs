@@ -468,6 +468,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "TRADE_LITE" => {
                             // 私有成交轻量版：立即打印，带本地时间戳（第一行）
                             let t_local = now_ms();
+                            let trade_id = v["t"].as_u64().unwrap_or(0);
                             println!(
                                 "[{t_local}] 成交 {} {} @ {}{} 成交ID={}",
                                 v["S"].as_str().unwrap_or("?"),
@@ -478,7 +479,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 } else {
                                     " 主动"
                                 },
-                                v["t"].as_str().unwrap_or("?"),
+                                trade_id,
                             );
                         }
                         "ACCOUNT_UPDATE" => manager_reader.on_account_update(&v),

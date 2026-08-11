@@ -259,11 +259,26 @@ fn now_ms() -> i64 {
 
 /// 用户数据流：连接 listenKey 通道，接收 ORDER_TRADE_UPDATE。
 /// 返回 (session, write_tx, 消息流)。write_tx 必须保活，否则阅读器死亡。
-async fn connect_user_stream(
+/// 裸连接用户流（已验证通：tmp_raw_user 裸连接能收到 NEW）。
+/// 不用 spawn_reader（其 connect_with_proxy 在 VPS 上收不到消息）。
+/// 返回 (ws 写端, ws 读端)。
+async fn connect_user_stream_raw(
     api_key: &str,
     rest_url: &str,
-) -> Result<(ws::WsSession, ws::WsWriteTx, mpsc::UnboundedReceiver<String>), String> {
-    // 拿 listenKey（POST /fapi/v1/listenKey，带 API key header）
+) -> Result<
+    (
+        futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            tokio_tungstenite::tungstenite::Message,
+        >,
+        futures_util::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        >,
+    ),
+    String,
+> {
+    use futures_util::StreamExt;
+
     let http = reqwest::Client::new();
     let resp: serde_json::Value = http
         .post(format!("{rest_url}/fapi/v1/listenKey"))
@@ -285,13 +300,11 @@ async fn connect_user_stream(
         format!("wss://fstream.binance.com/private/ws/{listen_key}")
     };
 
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    // ⚠ write_tx 必须保活：drop 会让阅读器 task 的 write_rx.recv() 返回 None → 连接死亡。
-    let (session, write_tx) = ws::spawn_reader(&ws_url, tx, shutdown_rx, Duration::from_millis(500))
+    // 裸连接（直连，不走 proxy 逻辑）
+    let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
-        .map_err(|e| e.to_string())?;
-    Ok((session, write_tx, rx))
+        .map_err(|e| format!("user stream connect: {e}"))?;
+    Ok(ws.split())
 }
 
 #[tokio::main]
@@ -338,29 +351,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("ws-fapi connect: {e}"))?;
     println!("    连接成功 ✓");
 
-    // 连接用户数据流
+    // 连接用户数据流（裸连接，已验证通）
     println!("[2] 连接用户数据流 (listenKey)...");
-    let (user_session, user_write, mut user_rx) = connect_user_stream(&key, rest_url).await?;
+    let (mut user_write, mut user_read) = connect_user_stream_raw(&key, rest_url).await?;
     println!("    连接成功 ✓");
-    let _keep_user = (user_session, user_write);
-    // 用户流连通性自检：连接后读 2s，确认消息通道是否通
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let mut got_any = false;
-    let probe_start = Instant::now();
-    while probe_start.elapsed() < Duration::from_secs(2) {
-        match tokio::time::timeout(Duration::from_millis(300), user_rx.recv()).await {
-            Ok(Some(msg)) => {
-                got_any = true;
-                eprintln!("[probe] 用户流自检收到: {}", &msg[..msg.len().min(80)]);
-            }
-            _ => continue,
-        }
-    }
-    if got_any {
-        println!("    用户流自检: 收到消息 ✓");
-    } else {
-        println!("    用户流自检: ⚠ 2s 内无消息（可能连接未通）");
-    }
+    println!("    用户流自检: 裸连接建立 ✓ (等待订单事件推送)");
 
     // REST 通道：纯 reqwest 签名下单（不 acquire listenKey，避免抢占用户流）
     println!("[3] 准备 REST 通道 (reqwest 签名)...");
@@ -434,7 +429,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let ws_order_id = ws_resp["result"]["orderId"].as_u64().unwrap_or(0);
             // 用户流 NEW 确认 + local-E/T
-            if let Some(c) = wait_for_order_status(&mut user_rx, &ws_cid.0, &["NEW", "PARTIALLY_FILLED"]).await {
+            if let Some(c) = wait_for_order_status(&mut user_read, &ws_cid.0, &["NEW", "PARTIALLY_FILLED"]).await {
                 let ws_to_new = c.local_recv_ms - t_ws0;
                 let local_e = c.local_recv_ms - c.gateway_ms;
                 let local_t = c.local_recv_ms - c.trade_ms;
@@ -464,7 +459,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if cstatus == 200 {
                 push(&mut s, "WS撤单→网卡", c_local as f64);
                 push(&mut s, "WS网卡→撤单ACK", c_wack as f64);
-                if let Some(cc) = wait_for_order_status(&mut user_rx, &ws_cid.0, &["CANCELED"]).await {
+                if let Some(cc) = wait_for_order_status(&mut user_read, &ws_cid.0, &["CANCELED"]).await {
                     let c0_to_c = cc.local_recv_ms - t_c0;
                     println!("  CANCELED(用户流): 发起→CANCELED={c0_to_c}ms");
                     push(&mut s, "WS发起→CANCELED", c0_to_c as f64);
@@ -500,7 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "  下单: status=200 策略→ACK={rest_ack_wall:.2}ms orderId={rest_oid}"
                 );
                 // 用户流 NEW 确认 + local-E/T
-                if let Some(c) = wait_for_order_status(&mut user_rx, &rest_cid.0, &["NEW", "PARTIALLY_FILLED"]).await {
+                if let Some(c) = wait_for_order_status(&mut user_read, &rest_cid.0, &["NEW", "PARTIALLY_FILLED"]).await {
                     let r_to_new = c.local_recv_ms - t_r0;
                     let local_e = c.local_recv_ms - c.gateway_ms;
                     let local_t = c.local_recv_ms - c.trade_ms;
@@ -524,7 +519,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  撤单: status={cr_status} 发起→ACK={cr_wall:.2}ms");
                 if cancel_r.is_ok() {
                     push(&mut s, "REST撤单→ACK", cr_wall);
-                    if let Some(cc) = wait_for_order_status(&mut user_rx, &rest_cid.0, &["CANCELED"]).await {
+                    if let Some(cc) = wait_for_order_status(&mut user_read, &rest_cid.0, &["CANCELED"]).await {
                         let c0_to_c = cc.local_recv_ms - t_cr;
                         println!("  CANCELED(用户流): 发起→CANCELED={c0_to_c}ms");
                         push(&mut s, "REST发起→CANCELED", c0_to_c as f64);
@@ -669,21 +664,24 @@ struct StreamConfirm {
 /// 从用户数据流等待指定状态的订单更新。
 /// 返回确认信息（含 E/T 时间戳用于 local-E / local-T 计算）。超时返回 None。
 async fn wait_for_order_status(
-    user_rx: &mut mpsc::UnboundedReceiver<String>,
+    user_read: &mut futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    >,
     client_order_id: &str,
     statuses: &[&str],
 ) -> Option<StreamConfirm> {
+    use futures_util::StreamExt;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        let msg = tokio::time::timeout(Duration::from_millis(500), user_rx.recv()).await;
-        let Ok(Some(msg)) = msg else {
-            continue; // 超时或通道关闭则继续等（不提前返回）
+        let msg = tokio::time::timeout(Duration::from_millis(500), user_read.next()).await;
+        let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) = msg else {
+            continue; // 超时或非文本则继续等
         };
+        let msg = text.to_string();
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) else {
             continue;
         };
         let evt = v["e"].as_str().unwrap_or("?");
-        eprintln!("[user-stream] 收到: e={evt} msg={}", &msg[..msg.len().min(80)]);
         if evt != "ORDER_TRADE_UPDATE" {
             continue;
         }

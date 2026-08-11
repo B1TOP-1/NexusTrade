@@ -564,6 +564,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             order = order.reduce_only();
         }
 
+        // 下单发起日志（带时间戳，place 之前）
+        let t_local = now_ms();
+        println!(
+            "[{t_local}] 发起 {} {} @ 市价 {} cid={cid}",
+            if is_open { "买入开仓" } else { "卖出平仓" },
+            qty,
+            if !is_open { "(reduceOnly)" } else { "" },
+        );
+
         // 下单：t_start = 策略开始 → place 返回 = ACK
         let t_start = std::time::Instant::now();
         let result = fapi.place(&order).await;
@@ -573,7 +582,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match result {
             Ok(order_id) => {
                 println!(
-                    "  市价单已下: orderId={order_id}  策略→ACK={:.2}ms",
+                    "[{t_local}] 已下单: orderId={order_id}  策略→ACK={:.2}ms",
                     ack_us / 1000.0
                 );
 

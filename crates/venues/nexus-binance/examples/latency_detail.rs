@@ -346,8 +346,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (user_session, user_write, mut user_rx) = connect_user_stream(&key, rest_url).await?;
     println!("    连接成功 ✓");
     let _keep_user = (user_session, user_write);
-    // 给用户流 WS 留出连接建立时间
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // 用户流连通性自检：连接后读 2s，确认消息通道是否通
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut got_any = false;
+    let probe_start = Instant::now();
+    while probe_start.elapsed() < Duration::from_secs(2) {
+        match tokio::time::timeout(Duration::from_millis(300), user_rx.recv()).await {
+            Ok(Some(msg)) => {
+                got_any = true;
+                eprintln!("[probe] 用户流自检收到: {}", &msg[..msg.len().min(80)]);
+            }
+            _ => continue,
+        }
+    }
+    if got_any {
+        println!("    用户流自检: 收到消息 ✓");
+    } else {
+        println!("    用户流自检: ⚠ 2s 内无消息（可能连接未通）");
+    }
 
     // 连接 REST venue（下单/撤单 REST 通道）
     println!("[3] 连接 REST venue...");

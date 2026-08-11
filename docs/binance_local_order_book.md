@@ -247,7 +247,95 @@ cargo run -p nexus-binance --example live_book -- --testnet BTCUSDT 30
 
 ---
 
-## 8. 参考文件
+## 8. WS 用户数据流连接陷阱（实测踩坑记录）
+
+> 时间：2026-08-11，VPS 直连 + 本地代理环境交叉验证。
+
+### 8.1 现象
+
+ws-fapi 下单成功（`status=200`），但用户数据流（listenKey 通道）收不到
+`ORDER_TRADE_UPDATE`（NEW/CANCELED），等待超时。
+
+### 8.2 根因：spawn_reader 封装收不到消息，裸连接能收到
+
+用户流连接方式对比：
+
+| 连接方式 | VPS 直连结果 |
+|---|---|
+| **裸连接** `tokio_tungstenite::connect_async().await` | ✅ 能收到 NEW/CANCELED |
+| **spawn_reader**（内部 `connect_with_proxy` + 后台重连循环） | ❌ 连接成功但收不到消息 |
+
+**关键差异**：
+- 裸连接：**同步** `connect_async().await` 等连接完成，再直接读 `SplitStream`
+- spawn_reader：**后台 task** 异步连接 + 重连循环，消息经 `tx.send` → `rx.recv()`
+
+虽然两者最终都走 `tokio_tungstenite::connect_async`，但 spawn_reader 的
+封装在 VPS 直连下实测收不到消息。**用裸连接替换后立即全部收到。**
+
+### 8.3 次要因素
+
+1. **listenKey 竞争**：`BinanceVenue::connect` 会 acquire 一个 listenKey（私有流），
+   与用户流 listenKey 竞争同一账号私有流。REST 通道改用纯 reqwest 签名（不 acquire
+   listenKey）后消除。但即使排除此因素，spawn_reader 仍收不到——非主因。
+2. **时序**：spawn_reader 后台连接，若未建立就下单，事件错过。裸连接同步建立无此问题。
+
+### 8.4 决定性验证
+
+| 测试 | 结果 |
+|---|---|
+| Python 裸连接 + ws-fapi 下单 | ✅ 收到 NEW |
+| Rust 裸连接 + REST 下单 | ✅ 收到 NEW |
+| Rust spawn_reader + 下单 | ❌ 收不到 |
+
+### 8.5 修复
+
+用户流改用**裸连接**（`connect_async` 直连），同步建立、直接读 `SplitStream`。
+见 `latency_detail.rs` 的 `connect_user_stream_raw`。
+
+---
+
+## 9. 下单全链路延迟实测（VPS 直连，2026-08-11）
+
+> 工具：`cargo run -p nexus-binance --example latency_detail -- --rounds 3`
+> 口径：**挂单确认 = 用户流 NEW**（ACK 仅是"发出"）；local-E = 本地收−E；local-T = 本地收−T。
+
+### 9.1 WS 下单链路
+
+| 环节 | min | avg | max |
+|---|---|---|---|
+| 策略→网卡（本地路径） | **0ms** | 0ms | 0ms |
+| 网卡→币安 ACK（网络） | 1ms | 1.7ms | 3ms |
+| 策略→ACK（发出） | 1.4ms | 2.1ms | 3.5ms |
+| **策略→用户流 NEW（挂单确认）** | **2ms** | **2.7ms** | 4ms |
+| local-E（本地收−E） | 1ms | 1ms | 1ms |
+| local-T（本地收−T） | 1ms | 1.7ms | 2ms |
+
+### 9.2 REST 下单链路
+
+| 环节 | min | avg | max |
+|---|---|---|---|
+| 策略→ACK（发出） | 2.5ms | 4.4ms | 8ms |
+| **策略→用户流 NEW（挂单确认）** | **3ms** | **4.7ms** | 8ms |
+| local-E | 1ms | 1ms | 1ms |
+| local-T | 1ms | 1ms | 1ms |
+
+### 9.3 撤单链路
+
+| 环节 | WS | REST |
+|---|---|---|
+| 发起→CANCELED（挂单确认） | **2ms** | 3.3ms |
+| 发起→ACK（发出） | 1.4ms | 2.6ms |
+
+### 9.4 结论
+
+- **WS 下单全链路 2ms**，比 REST 快 1ms；撤单 WS 2ms vs REST 3.3ms
+- **local-E / local-T = 1ms**：交易所推送与本地接收几乎同步
+- **本地路径 0-1ms**：策略发指令到网卡推出接近零延迟（架构底线③）
+- WS 下单比 REST 快约 40-50%（挂单确认口径）
+
+---
+
+## 10. 参考文件
 
 | 文件 | 说明 |
 |---|---|
@@ -256,5 +344,7 @@ cargo run -p nexus-binance --example live_book -- --testnet BTCUSDT 30
 | `crates/nexus-book/src/dual.rs` | Rust 双轨合并 |
 | `crates/venues/nexus-binance/src/market.rs` | Rust Binance 行情 adapter（100ms 订阅 + 桥接逻辑） |
 | `crates/venues/nexus-binance/src/ws.rs` | Rust WebSocket 传输层（直连优先/代理 fallback） |
+| `crates/venues/nexus-binance/src/ws_exec.rs` | Rust ws-fapi 下单客户端 |
 | `crates/venues/nexus-binance/src/types.rs` | Rust JSON 线格式定义 |
-| `crates/venues/nexus-binance/examples/live_book.rs` | Rust 集成测试示例 |
+| `crates/venues/nexus-binance/examples/live_book.rs` | Rust 本地订单簿集成示例 |
+| `crates/venues/nexus-binance/examples/latency_detail.rs` | Rust 下单全链路延迟测量（WS/REST 对比 + local-E/T） |

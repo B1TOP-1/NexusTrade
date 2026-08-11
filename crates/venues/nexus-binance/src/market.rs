@@ -216,6 +216,10 @@ struct CachedDelta {
     first_update_id: u64,
     final_update_id: u64,
     prev_final_id: u64,
+    /// E = 事件时间（网关吐出）。
+    gateway_ts_ms: i64,
+    /// T = 交易时间（撮合）。
+    venue_ts_ms: i64,
     bids: Vec<Level>,
     asks: Vec<Level>,
 }
@@ -306,6 +310,8 @@ async fn run_book_loop(
                 first_update_id: ev.first_update_id,
                 final_update_id: ev.final_update_id,
                 prev_final_id: ev.prev_final_id,
+                gateway_ts_ms: ev.event_time as i64,
+                venue_ts_ms: ev.transaction_time as i64,
                 bids,
                 asks,
             };
@@ -383,6 +389,8 @@ fn apply_delta(engine: &BookEngine, delta: &CachedDelta, seq: u64) {
     } else if !delta.asks.is_empty() {
         let _ = engine.apply_delta(Side::Ask, delta.asks.clone(), seq);
     }
+    // 记录事件时间戳（E = 网关吐出, T = 撮合），供 BookView 显示。
+    engine.note_ts(delta.gateway_ts_ms, delta.venue_ts_ms);
 }
 
 fn parse_levels(raw: &[[String; 2]]) -> Vec<Level> {
@@ -571,6 +579,7 @@ mod tests {
         let (e, h) = new_book(vec![lvl(100, 1.0)], vec![lvl(101, 1.0)]);
         apply_delta(&e, &CachedDelta {
             first_update_id: 1, final_update_id: 1, prev_final_id: 0,
+            gateway_ts_ms: 0, venue_ts_ms: 0,
             bids: vec![], asks: vec![],
         }, 1);
         let top = h.top().unwrap();
@@ -585,6 +594,7 @@ mod tests {
         let (e, h) = new_book(vec![lvl(100, 1.0)], vec![lvl(101, 1.0)]);
         apply_delta(&e, &CachedDelta {
             first_update_id: 1, final_update_id: 1, prev_final_id: 0,
+            gateway_ts_ms: 0, venue_ts_ms: 0,
             bids: vec![lvl(101, 2.0)], asks: vec![],
         }, 1);
         assert_eq!(h.top().unwrap().bid, dec!(101));
@@ -597,6 +607,7 @@ mod tests {
         let (e, h) = new_book(vec![lvl(100, 1.0)], vec![lvl(101, 1.0)]);
         apply_delta(&e, &CachedDelta {
             first_update_id: 1, final_update_id: 1, prev_final_id: 0,
+            gateway_ts_ms: 0, venue_ts_ms: 0,
             bids: vec![], asks: vec![lvl(100, 3.0)],
         }, 1);
         assert_eq!(h.top().unwrap().bid, dec!(100));
@@ -928,8 +939,8 @@ mod tests {
         let engine = Arc::new(BookEngine::new());
 
         let mut buffer: Vec<CachedDelta> = vec![
-            CachedDelta { first_update_id: 1, final_update_id: 1, prev_final_id: 0, bids: vec![lvl(50001, 0.5)], asks: vec![] },
-            CachedDelta { first_update_id: 2, final_update_id: 2, prev_final_id: 1, bids: vec![], asks: vec![lvl(50101, 0.3)] },
+            CachedDelta { first_update_id: 1, final_update_id: 1, prev_final_id: 0, gateway_ts_ms: 0, venue_ts_ms: 0, bids: vec![lvl(50001, 0.5)], asks: vec![] },
+            CachedDelta { first_update_id: 2, final_update_id: 2, prev_final_id: 1, gateway_ts_ms: 0, venue_ts_ms: 0, bids: vec![], asks: vec![lvl(50101, 0.3)] },
         ];
 
         let snap = DepthSnapshot {
@@ -946,7 +957,7 @@ mod tests {
         let mut last_u = snap.lastUpdateId;
 
         // Delta that bridges snapshot gap — bids only, no issue.
-        let d0 = CachedDelta { first_update_id: 1, final_update_id: 3, prev_final_id: 2, bids: vec![lvl(50001, 1.0)], asks: vec![] };
+        let d0 = CachedDelta { first_update_id: 1, final_update_id: 3, prev_final_id: 2, gateway_ts_ms: 0, venue_ts_ms: 0, bids: vec![lvl(50001, 1.0)], asks: vec![] };
         if d0.prev_final_id == last_u {
             apply_delta(&engine, &d0, 1);
             last_u = d0.final_update_id;
@@ -954,7 +965,7 @@ mod tests {
         assert_eq!(h.top().unwrap().bid, dec!(50001));
 
         // Delta that deletes the level — bids only, no issue.
-        let d1 = CachedDelta { first_update_id: 4, final_update_id: 4, prev_final_id: 3, bids: vec![lvl_z(50001)], asks: vec![] };
+        let d1 = CachedDelta { first_update_id: 4, final_update_id: 4, prev_final_id: 3, gateway_ts_ms: 0, venue_ts_ms: 0, bids: vec![lvl_z(50001)], asks: vec![] };
         if d1.prev_final_id == last_u {
             apply_delta(&engine, &d1, 2);
             last_u = d1.final_update_id;
@@ -962,7 +973,7 @@ mod tests {
         assert_eq!(h.top().unwrap().bid, dec!(50000)); // best reverts
 
         // Double-side delta now uses apply_delta_both → single seq, no spurious gap.
-        let d2 = CachedDelta { first_update_id: 5, final_update_id: 6, prev_final_id: 4, bids: vec![lvl(50002, 0.5)], asks: vec![lvl(50099, 2.0)] };
+        let d2 = CachedDelta { first_update_id: 5, final_update_id: 6, prev_final_id: 4, gateway_ts_ms: 0, venue_ts_ms: 0, bids: vec![lvl(50002, 0.5)], asks: vec![lvl(50099, 2.0)] };
         if d2.prev_final_id == last_u {
             apply_delta(&engine, &d2, 3);
             last_u = d2.final_update_id;
@@ -984,8 +995,8 @@ mod tests {
 
         // normal deltas
         let normal = [
-            CachedDelta { first_update_id: 101, final_update_id: 101, prev_final_id: 100, bids: vec![lvl(101, 0.5)], asks: vec![] },
-            CachedDelta { first_update_id: 102, final_update_id: 102, prev_final_id: 101, bids: vec![], asks: vec![lvl(199, 1.0)] },
+            CachedDelta { first_update_id: 101, final_update_id: 101, prev_final_id: 100, gateway_ts_ms: 0, venue_ts_ms: 0, bids: vec![lvl(101, 0.5)], asks: vec![] },
+            CachedDelta { first_update_id: 102, final_update_id: 102, prev_final_id: 101, gateway_ts_ms: 0, venue_ts_ms: 0, bids: vec![], asks: vec![lvl(199, 1.0)] },
         ];
         for (i, d) in normal.iter().enumerate() {
             apply_delta(&engine, d, (i + 1) as u64);
@@ -995,7 +1006,7 @@ mod tests {
         assert_eq!(engine.handle().top().unwrap().bid, dec!(101));
 
         // gap: prev_final_id=105 != 102
-        let gap = CachedDelta { first_update_id: 106, final_update_id: 107, prev_final_id: 105, bids: vec![lvl(150, 5.0)], asks: vec![] };
+        let gap = CachedDelta { first_update_id: 106, final_update_id: 107, prev_final_id: 105, gateway_ts_ms: 0, venue_ts_ms: 0, bids: vec![lvl(150, 5.0)], asks: vec![] };
         if gap.prev_final_id != last_u {
             last_u = 0; // trigger rebuild
         }

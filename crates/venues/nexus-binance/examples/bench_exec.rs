@@ -81,33 +81,22 @@ fn report(label: &str, samples: &[f64]) {
     );
 }
 
-// ── 参考价：post-only 价格计算 ──
+// ── 参考价：post-only 价格计算（全程 Decimal，杜绝 f64 浮点污染）──
 
-/// 从库的 price_ticker 取参考价，计算 post-only 不成交的价格。
-async fn fetch_reference_prices(
-    client: &BinanceClient,
-    symbol: &str,
-) -> Option<(f64, f64)> {
+/// 从库的 price_ticker 取参考价，价格从字符串解析为 Decimal（不经 f64），
+/// 按最小 tick（0.10）量化。返回 post-only 买价（盘口下方 0.5%，不成交）。
+async fn fetch_reference_prices(client: &BinanceClient, symbol: &str) -> Option<Decimal> {
+    use std::str::FromStr;
     match client.market().price_ticker(Some(symbol)).await {
         Ok(tickers) if !tickers.is_empty() => {
-            let price = tickers[0].price.parse::<f64>().unwrap_or(0.0);
-            let (buy, sell) = (price * 0.995, price * 1.005); // buy 在下方 0.5%，sell 在上方 0.5%
-            Some((quantize_tick(buy), quantize_tick(sell)))
+            let price = Decimal::from_str(&tickers[0].price).ok()?;
+            let buy = price * dec!(0.995); // 下方 0.5%
+            Some((buy / dec!(0.10)).round() * dec!(0.10)) // 量化到 0.10 tick
         }
         _ => {
             eprintln!("无法获取 {symbol} 参考价");
             None
         }
-    }
-}
-
-/// 量化价格到 tick（BTC/ETH 等主流是 0.10，回退 0.01）。
-/// 从 exchangeInfo 精确读 tick 成本高，这里用通用规则：按价格量级选 tick。
-fn quantize_tick(price: f64) -> f64 {
-    if price >= 100.0 {
-        (price / 0.10).round() * 0.10
-    } else {
-        (price / 0.01).round() * 0.01
     }
 }
 
@@ -306,12 +295,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         BinanceClient::new_with_credentials(Credentials::new(key.clone(), secret.clone()))
     };
 
-    // 取参考价
-    let Some((buy_price_f, _sell)) = fetch_reference_prices(&client, &symbol).await else {
+    // 取参考价（全程 Decimal，精确到 tick）
+    let Some(buy_price_dec) = fetch_reference_prices(&client, &symbol).await else {
         println!("无法获取参考价，退出。");
         return Ok(());
     };
-    let buy_price_dec = Decimal::from_f64_retain(buy_price_f).unwrap_or(dec!(1));
     println!(
         "  参考买价(post-only 0.5% 下方): {buy_price_dec} ({symbol})"
     );
@@ -351,6 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("  [binance-futures-rs]");
+    let buy_price_f = buy_price_dec.to_string().parse::<f64>().unwrap_or(0.0);
     bench_library(&client, &symbol, rounds, buy_price_f).await;
 
     println!("\n{}", "=".repeat(64));

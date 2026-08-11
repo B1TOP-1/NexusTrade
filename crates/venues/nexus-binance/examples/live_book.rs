@@ -124,8 +124,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 elapsed.as_secs() % 10
             );
 
+            // 事件时间戳：E = 网关吐出, T = 撮合；local-E = 本地收 - E（纯网络+本地）
+            let view = book.depth(1);
+            let e_ms = view.gateway_ts_ms;
+            let t_ms = view.venue_ts_ms;
+            let local_now = nexus_core::now_ms();
+            // 不 clamp：负数即表示本地时钟超前交易所网关，暴露时钟偏差。
+            let local_e = if e_ms > 0 { local_now - e_ms } else { 0 };
+            let t_minus_e = if e_ms > 0 && t_ms > 0 {
+                e_ms - t_ms
+            } else {
+                0
+            };
+
             print!(
-                "\r[{ts}] Bid: {bid:>10.4} x {bid_qty:<8.4} | Ask: {ask:>10.4} x {ask_qty:<8.4} | Spread: {spread:.4} ({spread_pct}%) | Updates: {updates:>5}     ",
+                "\r[{ts}] Bid: {bid:>10.4} x {bid_qty:<8.4} | Ask: {ask:>10.4} x {ask_qty:<8.4} | Spread: {spread:.4} ({spread_pct}%) | Updates: {updates:>5} | E={e_ms} T={t_ms} local-E={local_e}ms T→E={t_minus_e}ms     ",
                 bid = top.bid,
                 bid_qty = top.bid_qty,
                 ask = top.ask,

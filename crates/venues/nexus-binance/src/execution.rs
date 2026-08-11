@@ -324,6 +324,13 @@ impl PrivateVenue for BinanceVenue {
             .await
             .map_err(|e| NexusError::Transport(format!("account parse: {e}")))?;
         let account = AccountInfo::from_raw(&raw);
+        if raw.get("code").is_some() {
+            // Binance 错误响应：{"code":-xxx,"msg":"..."}，绝不能当成功吞掉。
+            return Err(NexusError::VenueReject {
+                code: raw["code"].to_string(),
+                msg: raw["msg"].as_str().unwrap_or("").to_string(),
+            });
+        }
 
         let positions = account
             .positions

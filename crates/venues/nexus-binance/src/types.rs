@@ -51,8 +51,12 @@ pub struct DepthSnapshot {
 pub struct DepthStreamData {
     #[serde(rename = "e")]
     pub event_type: String, // "depthUpdate"
+    /// E = 事件时间（网关吐出，local-E）。
     #[serde(rename = "E")]
     pub event_time: u64,
+    /// T = 交易时间（撮合时间，local-T）。盘口流里 E 与 T 并存。
+    #[serde(rename = "T", default)]
+    pub transaction_time: u64,
     #[serde(rename = "s")]
     pub symbol: String,
     #[serde(rename = "U")]

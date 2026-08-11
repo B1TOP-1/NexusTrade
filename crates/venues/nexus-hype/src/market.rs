@@ -172,6 +172,8 @@ impl BookReader for HypeBookHandle {
             asks,
             seq,
             local_recv_ms: ts,
+            gateway_ts_ms: 0,
+            venue_ts_ms: 0,
         }
     }
 

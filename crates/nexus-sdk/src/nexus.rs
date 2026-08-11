@@ -146,6 +146,8 @@ mod tests {
                 asks: Vec::new(),
                 seq: 7,
                 local_recv_ms: 0,
+            gateway_ts_ms: 0,
+            venue_ts_ms: 0,
             }
         }
         fn staleness(&self) -> Duration {

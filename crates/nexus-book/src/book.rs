@@ -35,6 +35,10 @@ pub(crate) struct BookInner {
     pub(crate) asks: Vec<Level>,
     pub(crate) seq: u64,
     pub(crate) last_update_ms: i64,
+    /// 最近事件的 E（交易所网关吐出时间，local-E）。0 = 未提供。
+    pub(crate) gateway_ts_ms: i64,
+    /// 最近事件的 T（交易所撮合时间，local-T）。0 = 未提供。
+    pub(crate) venue_ts_ms: i64,
     pub(crate) ready: bool,
 }
 
@@ -45,6 +49,8 @@ impl BookInner {
             asks: Vec::new(),
             seq: 0,
             last_update_ms: 0,
+            gateway_ts_ms: 0,
+            venue_ts_ms: 0,
             ready: false,
         }
     }
@@ -126,6 +132,8 @@ impl BookInner {
             asks: to_pairs(&self.asks),
             seq: self.seq,
             local_recv_ms: self.last_update_ms,
+            gateway_ts_ms: self.gateway_ts_ms,
+            venue_ts_ms: self.venue_ts_ms,
         }
     }
 
@@ -153,6 +161,16 @@ impl BookEngine {
         let old = self.inner.load_full();
         let mut inner = (*old).clone();
         inner.apply_snapshot(bids, asks);
+        self.inner.store(Arc::new(inner));
+    }
+
+    /// 记录最近事件的交易所时间戳（E = 网关吐出, T = 撮合）。
+    /// 由 adapter 在应用每个 delta 后调用，供 BookView 暴露显示。
+    pub fn note_ts(&self, gateway_ms: i64, venue_ms: i64) {
+        let old = self.inner.load_full();
+        let mut inner = (*old).clone();
+        inner.gateway_ts_ms = gateway_ms;
+        inner.venue_ts_ms = venue_ms;
         self.inner.store(Arc::new(inner));
     }
 

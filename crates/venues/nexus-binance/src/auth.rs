@@ -17,9 +17,17 @@ pub fn sign(query_string: &str, api_secret: &str) -> String {
 }
 
 /// 构造签名后的查询串：`{params}&timestamp={ms}&signature={hex}`
+///
+/// ⚠ 空参数时必须避免前导 `&`（`&timestamp=...`），否则签名串与真实请求
+/// 不一致，Binance 报 `-1022 Signature not valid`。签名串必须与发送的
+/// query string 逐字节一致。
 pub fn sign_request(params: &str, api_secret: &str) -> String {
     let ts = chrono::Utc::now().timestamp_millis();
-    let query = format!("{params}&timestamp={ts}");
+    let query = if params.is_empty() {
+        format!("timestamp={ts}")
+    } else {
+        format!("{params}&timestamp={ts}")
+    };
     let sig = sign(&query, api_secret);
     format!("{query}&signature={sig}")
 }

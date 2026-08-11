@@ -25,6 +25,12 @@ pub struct BookView {
     pub asks: Vec<(Decimal, Decimal)>,
     pub seq: u64,
     pub local_recv_ms: i64,
+    /// 最近事件的 E（交易所网关吐出时间，local-E）。0 = 未提供。
+    #[serde(default)]
+    pub gateway_ts_ms: i64,
+    /// 最近事件的 T（交易所撮合时间，local-T）。0 = 未提供。
+    #[serde(default)]
+    pub venue_ts_ms: i64,
 }
 
 /// 公开成交。仅作特征输入（主动方向/量），不作成交确认与延迟基准。

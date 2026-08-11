@@ -27,6 +27,8 @@ use binance_futures_rs::{
     QueryOrderRequest, TimeInForce,
 };
 use futures_util::StreamExt;
+use nexus_core::Decimal;
+use rust_decimal_macros::dec;
 
 // ── .env 加载（极简实现，不引 dotenv 依赖）──
 
@@ -272,8 +274,12 @@ async fn place_and_cancel(
     } else {
         reference * (1.0 + offset_pct / 100.0)
     };
-    // 量化到 tick（0.10），避免 -1111 精度超限。
-    let price = (price / 0.10).round() * 0.10;
+    // 量化到 tick（0.10），用 Decimal 精确运算避免 -1111 浮点污染。
+    let price = {
+        let d = Decimal::from_f64_retain(price).unwrap_or_default();
+        let q = (d / dec!(0.10)).round() * dec!(0.10);
+        q.to_string().parse::<f64>().unwrap_or(price)
+    };
     let price_str = format!("{price:.2}");
     let qty_str = format!("{qty}");
 

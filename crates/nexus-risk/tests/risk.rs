@@ -44,6 +44,8 @@ impl BookReader for MockBook {
             asks: Vec::new(),
             seq: 0,
             local_recv_ms: 0,
+            gateway_ts_ms: 0,
+            venue_ts_ms: 0,
         }
     }
 

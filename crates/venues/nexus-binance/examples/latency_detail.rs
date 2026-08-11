@@ -261,11 +261,11 @@ fn now_ms() -> i64 {
 }
 
 /// 用户数据流：连接 listenKey 通道，接收 ORDER_TRADE_UPDATE。
-/// 返回 (session, 消息流)。消息为原始 JSON 字符串。
+/// 返回 (session, write_tx, 消息流)。write_tx 必须保活，否则阅读器死亡。
 async fn connect_user_stream(
     api_key: &str,
     rest_url: &str,
-) -> Result<(ws::WsSession, mpsc::UnboundedReceiver<String>), String> {
+) -> Result<(ws::WsSession, ws::WsWriteTx, mpsc::UnboundedReceiver<String>), String> {
     // 拿 listenKey（POST /fapi/v1/listenKey，带 API key header）
     let http = reqwest::Client::new();
     let resp: serde_json::Value = http
@@ -290,10 +290,11 @@ async fn connect_user_stream(
 
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let (session, _write) = ws::spawn_reader(&ws_url, tx, shutdown_rx, Duration::from_millis(500))
+    // ⚠ write_tx 必须保活：drop 会让阅读器 task 的 write_rx.recv() 返回 None → 连接死亡。
+    let (session, write_tx) = ws::spawn_reader(&ws_url, tx, shutdown_rx, Duration::from_millis(500))
         .await
         .map_err(|e| e.to_string())?;
-    Ok((session, rx))
+    Ok((session, write_tx, rx))
 }
 
 #[tokio::main]
@@ -342,9 +343,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 连接用户数据流
     println!("[2] 连接用户数据流 (listenKey)...");
-    let (user_session, mut user_rx) = connect_user_stream(&key, rest_url).await?;
+    let (user_session, user_write, mut user_rx) = connect_user_stream(&key, rest_url).await?;
     println!("    连接成功 ✓");
-    let _keep_user = user_session;
+    let _keep_user = (user_session, user_write);
     // 给用户流 WS 留出连接建立时间
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
@@ -596,6 +597,7 @@ async fn wait_for_order_status(
             continue;
         };
         let evt = v["e"].as_str().unwrap_or("?");
+        eprintln!("[user-stream] 收到: e={evt} msg={}", &msg[..msg.len().min(80)]);
         if evt != "ORDER_TRADE_UPDATE" {
             continue;
         }

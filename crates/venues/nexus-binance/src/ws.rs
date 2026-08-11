@@ -84,6 +84,7 @@ pub async fn spawn_reader_with_hook(
                     continue;
                 }
             };
+            eprintln!("[binance-ws] connected to {url_owned}");
             let (mut write, mut read) = ws.split();
 
             // 泵循环。

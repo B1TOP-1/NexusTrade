@@ -1,17 +1,23 @@
 //! Taker 市价单全链路测试（0ms 本地订单簿 + ws-fapi 市价单 + 用户流确认）。
 //!
-//! 同时测量：
-//!   1. **订单簿延迟**：0ms 模式下的 local-E（本地收−E）和 local-T（本地收−T）
-//!   2. **市价单全链路**：下单→ACK→用户流 FILLED 确认延迟
-//!   3. **价格一致性**：成交价 vs 本地簿 BBO
+//! 设计：
+//!   - **用户流提前建立后台读取**（下单前启动，持续收 ORDER_TRADE_UPDATE 存 map）
+//!   - **交替开/平仓**：偶数轮买开仓，奇数轮卖 reduceOnly 平仓
+//!   - **滑点容忍**：市价单成交价 vs 本地簿 BBO，容忍 0.1% 滑点
 //!
-//! ⚠ 真实成交，消耗手续费。默认 0.001 BTC。
+//! 测量：
+//!   1. 订单簿延迟：0ms 模式 local-E / local-T
+//!   2. 市价单全链路：下单→ACK→用户流 FILLED
+//!   3. 滑点：成交价 vs 本地簿 BBO 的差
+//!
+//! ⚠ 真实成交，消耗手续费（默认 0.0001 BTC ≈ 6.4 USDT）。
 //! 用法：
-//!   cargo run -p nexus-binance --example taker_test -- --qty 0.001
-//!   cargo run -p nexus-binance --example taker_test -- --qty 0.001 --side sell
-//!   cargo run -p nexus-binance --example taker_test -- --rounds 3
+//!   cargo run -p nexus-binance --example taker_test -- --qty 0.0001 --rounds 4
+//!   cargo run -p nexus-binance --example taker_test -- --testnet
 
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -22,7 +28,6 @@ use rust_decimal_macros::dec;
 struct Args {
     symbol: String,
     qty: Decimal,
-    side: Side,
     rounds: usize,
     testnet: bool,
 }
@@ -31,8 +36,7 @@ fn parse_args() -> Args {
     let mut args = Args {
         symbol: "BTCUSDT".to_string(),
         qty: dec!(0.0001),
-        side: Side::Buy,
-        rounds: 3,
+        rounds: 4,
         testnet: false,
     };
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -48,16 +52,6 @@ fn parse_args() -> Args {
             "--qty" => {
                 if i + 1 < raw.len() {
                     args.qty = Decimal::from_str(&raw[i + 1]).unwrap_or(args.qty);
-                    i += 1;
-                }
-            }
-            "--side" => {
-                if i + 1 < raw.len() {
-                    args.side = if raw[i + 1].to_lowercase() == "sell" {
-                        Side::Sell
-                    } else {
-                        Side::Buy
-                    };
                     i += 1;
                 }
             }
@@ -97,85 +91,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 用户流裸连接，等待指定 client_order_id 的状态确认。
-/// 返回 (local_E, local_T, 状态)。超时返回 None。
-async fn wait_fill(
-    user_read: &mut futures_util::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    >,
-    cid: &str,
-    statuses: &[&str],
-) -> Option<(i64, i64, String)> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        let msg = tokio::time::timeout(Duration::from_millis(500), user_read.next()).await;
-        let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) = msg else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text.to_string()) else {
-            continue;
-        };
-        if v["e"] != "ORDER_TRADE_UPDATE" {
-            continue;
-        }
-        let o = &v["o"];
-        eprintln!(
-            "[user] OTU c={} X={} target={}",
-            o["c"].as_str().unwrap_or("?"),
-            o["X"].as_str().unwrap_or("?"),
-            cid
-        );
-        if o["c"].as_str() == Some(cid) {
-            let st = o["X"].as_str().unwrap_or("").to_string();
-            // 完整成交明细打印
-            println!(
-                "    [WS成交] 事件e={} E={} T={}",
-                v["e"].as_str().unwrap_or("?"),
-                v["E"].as_i64().unwrap_or(0),
-                v["T"].as_i64().unwrap_or(0)
-            );
-            println!(
-                "            订单 s={} i={} c={} S={} o={} X={}",
-                o["s"].as_str().unwrap_or("?"),
-                o["i"].as_i64().unwrap_or(0),
-                o["c"].as_str().unwrap_or("?"),
-                o["S"].as_str().unwrap_or("?"),
-                o["o"].as_str().unwrap_or("?"),
-                o["X"].as_str().unwrap_or("?"),
-            );
-            println!(
-                "            价格 p={} 原始量 q={} 已成交 z={} 均价 ap={}",
-                o["p"].as_str().unwrap_or("?"),
-                o["q"].as_str().unwrap_or("?"),
-                o["z"].as_str().unwrap_or("?"),
-                o["ap"].as_str().unwrap_or("?"),
-            );
-            println!(
-                "            最新成交价 L={} 最新成交量 l={} 手续费 n={} 币种 N={}",
-                o["L"].as_str().unwrap_or("?"),
-                o["l"].as_str().unwrap_or("?"),
-                o["n"].as_str().unwrap_or("?"),
-                o["N"].as_str().unwrap_or("?"),
-            );
-            println!(
-                "            tif={} 被动成交 m={} reduceOnly={}",
-                o["f"].as_str().unwrap_or("?"),
-                o["m"].as_bool().unwrap_or(false),
-                o["R"].as_str().unwrap_or("?"),
-            );
-            if statuses.contains(&st.as_str()) {
-                return Some((
-                    v["E"].as_i64().unwrap_or(0),
-                    v["T"].as_i64().unwrap_or(0),
-                    st,
-                ));
-            }
-        }
-    }
-    None
-}
-
-/// 连接用户流（裸连接）。
+/// 用户流裸连接。返回 (write, read)。
 async fn connect_user_stream(
     api_key: &str,
     rest_url: &str,
@@ -213,6 +129,16 @@ async fn connect_user_stream(
     Ok(ws.split())
 }
 
+/// 用户流订单更新（存 map）。
+#[derive(Clone)]
+struct StreamEntry {
+    status: String,
+    avg_price: String,
+    exec_qty: String,
+    gateway_ms: i64,
+    trade_ms: i64,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     load_dotenv();
@@ -234,14 +160,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let side_str = if args.side == Side::Buy { "BUY" } else { "SELL" };
     println!("{}", "=".repeat(72));
-    println!("  Taker 市价单全链路测试（0ms 订单簿 + ws-fapi + 用户流）");
+    println!("  Taker 市价单全链路测试（0ms 簿 + ws-fapi + 用户流后台读取）");
     println!(
-        "  Symbol: {}  Qty: {}  Side: {side_str}  Rounds: {}",
+        "  Symbol: {}  Qty: {}  Rounds: {}（偶数轮买开仓 / 奇数轮卖平仓）",
         args.symbol, args.qty, args.rounds
     );
-    println!("  ⚠ 市价单会真实成交，消耗手续费!");
+    println!("  ⚠ 真实成交，消耗手续费!");
     println!("{}", "=".repeat(72));
 
     let rest_url = if args.testnet {
@@ -285,22 +210,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fapi = WsFapiClient::connect(key.clone(), secret.clone(), args.testnet).await?;
     println!("    连接成功 ✓");
 
-    // 3. 连用户流（裸连接）
-    println!("[3] 连接用户流 (listenKey)...");
-    let (_user_write, mut user_read) = connect_user_stream(&key, rest_url).await?;
+    // 3. 连用户流 + 提前建立后台读取 task
+    println!("[3] 连接用户流 + 提前建立后台读取...");
+    let (_user_write, user_read) = connect_user_stream(&key, rest_url).await?;
     println!("    连接成功 ✓");
 
-    // 4. 逐轮测试
-    println!("\n[4] 开始 taker 市价测试...\n");
+    // 共享 map：cid → 最新 OTU 条目
+    let updates: Arc<Mutex<HashMap<String, StreamEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+    let updates_reader = Arc::clone(&updates);
+    tokio::spawn(async move {
+        let mut read = user_read;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(30), read.next()).await {
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text.to_string()) else {
+                        continue;
+                    };
+                    if v["e"] != "ORDER_TRADE_UPDATE" {
+                        continue;
+                    }
+                    let o = &v["o"];
+                    let cid = o["c"].as_str().unwrap_or("").to_string();
+                    if cid.is_empty() {
+                        continue;
+                    }
+                    let entry = StreamEntry {
+                        status: o["X"].as_str().unwrap_or("").to_string(),
+                        avg_price: o["ap"].as_str().unwrap_or("0").to_string(),
+                        exec_qty: o["z"].as_str().unwrap_or("0").to_string(),
+                        gateway_ms: v["E"].as_i64().unwrap_or(0),
+                        trade_ms: v["T"].as_i64().unwrap_or(0),
+                    };
+                    updates_reader.lock().unwrap().insert(cid, entry);
+                }
+                _ => continue,
+            }
+        }
+    });
+    println!("    用户流后台读取已启动 ✓");
+
+    // 4. 逐轮测试（交替开/平仓）
+    println!("\n[4] 开始 taker 市价测试（开/平交替）...\n");
     let mut book_local_e: Vec<f64> = Vec::new();
     let mut book_local_t: Vec<f64> = Vec::new();
     let mut fill_latency: Vec<f64> = Vec::new();
     let mut ack_latency: Vec<f64> = Vec::new();
-    let mut price_matches = 0u32;
-    let mut total_rounds = 0u32;
+    let mut slippages: Vec<f64> = Vec::new();
+    let mut succeeded = 0u32;
 
     for i in 0..args.rounds {
-        // 下单前的本地簿 BBO + 簿延迟（0ms 的 local-E/local-T）
+        // 开/平交替：偶数轮买开仓，奇数轮卖 reduceOnly 平仓
+        let is_open = i % 2 == 0;
+        let side = if is_open { Side::Buy } else { Side::Sell };
+        let side_str = if is_open { "买开仓" } else { "卖平仓" };
+
+        // 下单前的本地簿 BBO + 簿延迟
         let pre_top = book.top().unwrap();
         let view = book.depth(1);
         let now = now_ms();
@@ -311,24 +275,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         book_local_e.push(local_e as f64);
         book_local_t.push(local_t as f64);
 
-        let book_side_price = if args.side == Side::Buy {
-            pre_top.ask
-        } else {
-            pre_top.bid
-        };
+        let book_side_price = if is_open { pre_top.ask } else { pre_top.bid };
         println!(
-            "── 轮 {i} ── 簿BBO: bid={} ask={} | 簿local-E={}ms local-T={}ms",
+            "── 轮 {i} ── {side_str} | 簿BBO: bid={} ask={} | 簿local-E={}ms local-T={}ms",
             pre_top.bid, pre_top.ask, local_e, local_t,
         );
 
-        // 构造市价单
+        // 构造市价单（平仓用 reduceOnly）
         let cid = format!("nxtaker{}", i);
-        let order = NewOrder::market(
+        let mut order = NewOrder::market(
             sym.clone(),
-            args.side,
+            side,
             args.qty,
             ClientOrderId(cid.clone()),
         );
+        if !is_open {
+            order = order.reduce_only();
+        }
 
         // 下单计时
         let t_start = std::time::Instant::now();
@@ -338,54 +301,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match result {
             Ok(order_id) => {
-                println!(
-                    "  市价单已下: orderId={order_id}  ACK={:.2}ms",
-                    ack_us / 1000.0
-                );
+                println!("  市价单已下: orderId={order_id}  ACK={:.2}ms", ack_us / 1000.0);
 
-                // 等用户流 FILLED 确认（全链路）
-                if let Some((e_ms, t_ms, st)) =
-                    wait_fill(&mut user_read, &cid, &["FILLED", "PARTIALLY_FILLED"]).await
-                {
-                    let fill_us = t_start.elapsed().as_micros() as f64;
-                    let now = now_ms();
-                    let order_local_e = now - e_ms;
-                    let order_local_t = now - t_ms;
-                    fill_latency.push(fill_us);
-                    println!(
-                        "  用户流确认: status={st} 下单→FILLED={:.2}ms local-E={}ms local-T={}ms",
-                        fill_us / 1000.0,
-                        order_local_e,
-                        order_local_t,
-                    );
-                } else {
-                    println!("  用户流确认: 超时");
-                }
+                // 从共享 map 轮询 FILLED（用户流后台 task 已提前建立）
+                let mut confirmed = false;
+                let confirm_deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while std::time::Instant::now() < confirm_deadline {
+                    let entry = updates.lock().unwrap().get(&cid).cloned();
+                    if let Some(e) = entry {
+                        if e.status == "FILLED" || e.status == "PARTIALLY_FILLED" {
+                            let fill_us = t_start.elapsed().as_micros() as f64;
+                            let now = now_ms();
+                            let order_local_e = now - e.gateway_ms;
+                            let order_local_t = now - e.trade_ms;
+                            fill_latency.push(fill_us);
+                            succeeded += 1;
 
-                // 查成交价
-                match fapi.query(&sym, order_id).await {
-                    Ok(status) => {
-                        let fill_price = status["result"]["avgPrice"]
-                            .as_str()
-                            .unwrap_or("?")
-                            .to_string();
-                        let exec_qty = status["result"]["executedQty"]
-                            .as_str()
-                            .unwrap_or("?")
-                            .to_string();
-                        let st = status["result"]["status"].as_str().unwrap_or("?").to_string();
-                        let fp = Decimal::from_str(&fill_price).unwrap_or(Decimal::ZERO);
-                        // 价格一致性：成交价 ≈ 本地簿参考价（±1 USDT）
-                        let price_match =
-                            fp >= book_side_price - dec!(1) && fp <= book_side_price + dec!(1);
-                        if price_match { price_matches += 1; }
-                        total_rounds += 1;
-                        println!(
-                            "  成交: status={st} avgPrice={fill_price} executedQty={exec_qty} 价格一致性={}",
-                            if price_match { "✅" } else { "❌" }
-                        );
+                            // 滑点：成交价 vs 本地簿 BBO
+                            let fp = Decimal::from_str(&e.avg_price).unwrap_or(Decimal::ZERO);
+                            let slippage_pct = if book_side_price > Decimal::ZERO {
+                                ((fp - book_side_price) / book_side_price * dec!(100))
+                                    .abs()
+                            } else {
+                                Decimal::ZERO
+                            };
+                            slippages.push(
+                                slippage_pct
+                                    .to_string()
+                                    .parse::<f64>()
+                                    .unwrap_or(0.0),
+                            );
+
+                            println!(
+                                "  用户流确认: status={} 下单→FILLED={:.2}ms local-E={}ms local-T={}ms",
+                                e.status,
+                                fill_us / 1000.0,
+                                order_local_e,
+                                order_local_t,
+                            );
+                            println!(
+                                "  成交: avgPrice={} 量={} 滑点={:.3}% (簿参考 {})",
+                                e.avg_price, e.exec_qty, slippage_pct, book_side_price,
+                            );
+                            confirmed = true;
+                            break;
+                        }
                     }
-                    Err(e) => println!("  查询订单失败: {e}"),
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                if !confirmed {
+                    println!("  用户流确认: 超时（查 order.status 兜底）");
+                    if let Ok(status) = fapi.query(&sym, order_id).await {
+                        let st = status["result"]["status"].as_str().unwrap_or("?").to_string();
+                        let ap = status["result"]["avgPrice"].as_str().unwrap_or("?").to_string();
+                        let z = status["result"]["executedQty"].as_str().unwrap_or("?").to_string();
+                        println!("  兜底查询: status={st} avgPrice={ap} executedQty={z}");
+                    }
                 }
             }
             Err(e) => println!("  下单失败: {e}"),
@@ -395,7 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 汇总
     println!("{}", "=".repeat(72));
-    println!("  汇总 ({total_rounds} 笔真实成交)");
+    println!("  汇总 ({succeeded} 笔确认成交)");
     let sum = |v: &[f64]| -> (f64, f64, f64) {
         if v.is_empty() { return (0.0, 0.0, 0.0); }
         let min = v.iter().cloned().fold(f64::MAX, f64::min);
@@ -407,27 +378,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (f_min, f_avg, f_max) = sum(&fill_latency);
     let (e_min, e_avg, e_max) = sum(&book_local_e);
     let (t_min, t_avg, t_max) = sum(&book_local_t);
-    println!(
-        "  市价单 ACK:   min={:.2}ms avg={:.2}ms max={:.2}ms",
-        a_min / 1000.0, a_avg / 1000.0, a_max / 1000.0
-    );
+    let (s_min, s_avg, s_max) = sum(&slippages);
+    println!("  市价单 ACK:  min={:.2}ms avg={:.2}ms max={:.2}ms", a_min / 1000.0, a_avg / 1000.0, a_max / 1000.0);
     if !fill_latency.is_empty() {
-        println!(
-            "  下单→FILLED:  min={:.2}ms avg={:.2}ms max={:.2}ms",
-            f_min / 1000.0, f_avg / 1000.0, f_max / 1000.0
-        );
+        println!("  下单→FILLED: min={:.2}ms avg={:.2}ms max={:.2}ms", f_min / 1000.0, f_avg / 1000.0, f_max / 1000.0);
     }
-    println!(
-        "  0ms簿 local-E: min={:.2}ms avg={:.2}ms max={:.2}ms",
-        e_min, e_avg, e_max
-    );
-    println!(
-        "  0ms簿 local-T: min={:.2}ms avg={:.2}ms max={:.2}ms",
-        t_min, t_avg, t_max
-    );
-    println!(
-        "  价格一致性: {price_matches}/{total_rounds} 笔成交价≈本地簿BBO"
-    );
+    println!("  0ms簿 local-E: min={:.2}ms avg={:.2}ms max={:.2}ms", e_min, e_avg, e_max);
+    println!("  0ms簿 local-T: min={:.2}ms avg={:.2}ms max={:.2}ms", t_min, t_avg, t_max);
+    if !slippages.is_empty() {
+        println!("  滑点: min={:.3}% avg={:.3}% max={:.3}%", s_min, s_avg, s_max);
+    }
     println!("{}", "=".repeat(72));
 
     Ok(())

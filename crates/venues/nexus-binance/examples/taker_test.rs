@@ -619,8 +619,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             String::new()
                         };
+                        let base_asset = args.symbol.replace("USDT", "");
                         println!(
-                            "[成交] {} {} {} @ {} 滑点{:.2}%{} 余额={} 仓位={}",
+                            "[成交] {} {} {} @ {} 滑点{:.2}%{} 余额={}USDT 仓位={}{}",
                             if final_state.status == OrderStatus::Filled { "FILLED" } else { final_state.status.as_str() },
                             if is_open { "BUY" } else { "SELL" },
                             final_state.executed_qty,
@@ -629,6 +630,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             fee_str,
                             balance,
                             position,
+                            base_asset,
                         );
 
                         // 第二行：延迟明细

@@ -498,9 +498,16 @@ async fn wait_for_order_status(
         };
         let evt = v["e"].as_str().unwrap_or("?");
         if evt != "ORDER_TRADE_UPDATE" {
+            eprintln!("[user-stream] 非订单事件: e={evt}");
             continue;
         }
         let o = &v["o"];
+        eprintln!(
+            "[user-stream] OTU c={} X={} target={}",
+            o["c"].as_str().unwrap_or("?"),
+            o["X"].as_str().unwrap_or("?"),
+            client_order_id
+        );
         if o["c"].as_str() == Some(client_order_id) {
             let st = o["X"].as_str().unwrap_or("");
             if statuses.contains(&st) {

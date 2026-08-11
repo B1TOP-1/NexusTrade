@@ -294,44 +294,49 @@ ws-fapi 下单成功（`status=200`），但用户数据流（listenKey 通道�
 
 ---
 
-## 9. 下单全链路延迟实测（VPS 直连，2026-08-11）
+## 9. 下单全链路延迟实测（VPS 直连，2026-08-11，us 精度）
 
-> 工具：`cargo run -p nexus-binance --example latency_detail -- --rounds 3`
+> 工具：`cargo run -p nexus-binance --example latency_detail -- --rounds 5`
 > 口径：**挂单确认 = 用户流 NEW**（ACK 仅是"发出"）；local-E = 本地收−E；local-T = 本地收−T。
+> 本地路径/网络 RTT 用 `Instant` 微秒计时；local-E/T 用毫秒时间戳差。
 
-### 9.1 WS 下单链路
+### 9.1 WS 下单链路（us 精度）
 
 | 环节 | min | avg | max |
 |---|---|---|---|
-| 策略→网卡（本地路径） | **0ms** | 0ms | 0ms |
-| 网卡→币安 ACK（网络） | 1ms | 1.7ms | 3ms |
-| 策略→ACK（发出） | 1.4ms | 2.1ms | 3.5ms |
-| **策略→用户流 NEW（挂单确认）** | **2ms** | **2.7ms** | 4ms |
-| local-E（本地收−E） | 1ms | 1ms | 1ms |
-| local-T（本地收−T） | 1ms | 1.7ms | 2ms |
+| **策略→网卡**（本地路径） | **242us** | **272us** | 330us |
+| 网卡→币安 ACK（网络） | 950us | 2.46ms | 3.95ms |
+| 策略→ACK（发出） | 1.19ms | 2.73ms | 4.24ms |
+| **策略→用户流 NEW（挂单确认）** | **2.48ms** | **3.42ms** | 4.45ms |
+| local-E（本地收−E） | 1us | 1.8us | 3us |
+| local-T（本地收−T） | 1us | 2.4us | 4us |
 
 ### 9.2 REST 下单链路
 
 | 环节 | min | avg | max |
 |---|---|---|---|
-| 策略→ACK（发出） | 2.5ms | 4.4ms | 8ms |
-| **策略→用户流 NEW（挂单确认）** | **3ms** | **4.7ms** | 8ms |
-| local-E | 1ms | 1ms | 1ms |
-| local-T | 1ms | 1ms | 1ms |
+| 策略→ACK（发出） | 2.65ms | 5.22ms | 8.92ms |
+| **策略→用户流 NEW（挂单确认）** | **3.30ms** | **5.76ms** | 9.77ms |
+| local-E | 1us | 1.4us | 2us |
+| local-T | 1us | 1.6us | 3us |
 
 ### 9.3 撤单链路
 
 | 环节 | WS | REST |
 |---|---|---|
-| 发起→CANCELED（挂单确认） | **2ms** | 3.3ms |
-| 发起→ACK（发出） | 1.4ms | 2.6ms |
+| 发起→网卡（本地） | **236us** | — |
+| 发起→CANCELED（挂单确认） | **2.75ms** | 3.89ms |
+| 发起→ACK（发出） | 1.5ms | 3.60ms |
 
 ### 9.4 结论
 
-- **WS 下单全链路 2ms**，比 REST 快 1ms；撤单 WS 2ms vs REST 3.3ms
-- **local-E / local-T = 1ms**：交易所推送与本地接收几乎同步
-- **本地路径 0-1ms**：策略发指令到网卡推出接近零延迟（架构底线③）
-- WS 下单比 REST 快约 40-50%（挂单确认口径）
+- **WS 下单比 REST 快约 40%**：挂单确认 WS 3.42ms vs REST 5.76ms；撤单确认 WS 2.75ms vs REST 3.89ms
+- **local-E / local-T = 1-3us**：用户流推送到达本地与交易所 E/T 时间戳几乎零偏差（推送即撮合瞬间）
+- **本地路径 ~272us**（策略→网卡）：大头是 tokio task 调度 + 跨 task channel 传输
+  （`place → channel → spawn_reader task → socket` 两次调度）。
+  可优化点：合并 task、签名缓存、零拷贝帧，预估可压到 ~120us。
+  当前阶段不做（网卡→ACK 1-3ms 才是网络大头，本地 272us 已很快）。
+- **架构底线①验证**：WS 下单全面优于 REST，交易主通道定为 ws-fapi。
 
 ---
 

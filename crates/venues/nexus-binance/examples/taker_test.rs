@@ -30,7 +30,7 @@ struct Args {
 fn parse_args() -> Args {
     let mut args = Args {
         symbol: "BTCUSDT".to_string(),
-        qty: dec!(0.001),
+        qty: dec!(0.0001),
         side: Side::Buy,
         rounds: 3,
         testnet: false,
@@ -119,6 +119,12 @@ async fn wait_fill(
             continue;
         }
         let o = &v["o"];
+        eprintln!(
+            "[user] OTU c={} X={} target={}",
+            o["c"].as_str().unwrap_or("?"),
+            o["X"].as_str().unwrap_or("?"),
+            cid
+        );
         if o["c"].as_str() == Some(cid) {
             let st = o["X"].as_str().unwrap_or("").to_string();
             // 完整成交明细打印

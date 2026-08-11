@@ -66,11 +66,19 @@ type Registry = Arc<Mutex<HashMap<String, OrderEntry>>>;
 pub struct BinanceVenue {
     config: BinanceVenueConfig,
     http: reqwest::Client,
+    /// listenKey 守卫（私有流生命周期）。subscribe 时重新 acquire，
+    /// 此处保留实例引用便于扩展统一 listenKey 管理。
+    #[allow(dead_code)]
     listen_key: Mutex<Option<ListenKeyGuard>>,
     registry: Registry,
     ready: AtomicBool,
+    #[allow(dead_code)]
     _ws: Mutex<Option<ws::WsSession>>,
+    /// 私有流关闭信号（run_private_loop 断连时触发）。
+    #[allow(dead_code)]
     shutdown_tx: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    /// WS 下单 ID 生成器（ws-fapi 下单接入时使用）。
+    #[allow(dead_code)]
     id_counter: AtomicU64,
 }
 
@@ -95,6 +103,8 @@ impl BinanceVenue {
         Ok(venue)
     }
 
+    /// WS 下单 ID 生成（ws-fapi 下单接入时使用；当前 REST 下单直接构造 client_order_id）。
+    #[allow(dead_code)]
     fn next_id(&self) -> String {
         let n = self.id_counter.fetch_add(1, Ordering::Relaxed);
         format!("nxbn-{n}")
@@ -384,9 +394,16 @@ async fn run_private_loop(
         let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<String>();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let (_session, _write) =
-            ws::spawn_reader(&url, raw_tx, shutdown_rx, std::time::Duration::from_millis(500))
-                .await?;
+        // ⚠ 用户流必须用裸连接（spawn_reader 的 connect_with_proxy 在 VPS 上
+        // 收不到消息）。write_tx 必须保活，drop 会让阅读器死亡。
+        let (session, _write) = ws::spawn_reader_raw(
+            &url,
+            raw_tx,
+            shutdown_rx,
+            std::time::Duration::from_millis(500),
+        )
+        .await?;
+        let _keep = (session, _write);
 
         while let Some(msg) = raw_rx.recv().await {
             let event: UserStreamEvent = match serde_json::from_str(&msg) {

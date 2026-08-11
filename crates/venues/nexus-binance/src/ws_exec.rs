@@ -31,7 +31,6 @@ type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>
 /// WS 下单客户端。
 #[derive(Clone)]
 pub struct WsFapiClient {
-    url: String,
     api_key: String,
     api_secret: String,
     id_counter: Arc<AtomicU64>,
@@ -85,7 +84,6 @@ impl WsFapiClient {
         });
 
         Ok(Self {
-            url,
             api_key,
             api_secret,
             id_counter: Arc::new(AtomicU64::new(1)),

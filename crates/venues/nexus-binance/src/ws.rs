@@ -155,6 +155,95 @@ pub async fn spawn_reader(
     spawn_reader_with_hook(url, tx, shutdown_rx, reconnect_delay, None).await
 }
 
+/// 裸连接版本：直接用 `connect_async` 直连（不经 connect_with_proxy）。
+///
+/// ⚠ 实测：用户数据流（listenKey 通道）用 `connect_with_proxy` 在 VPS 上
+/// 收不到消息，改用裸连接后正常。私有流/用户流必须用这个版本。
+///
+/// 其余行为与 `spawn_reader` 一致（重连、Pong、保活）。
+pub async fn spawn_reader_raw(
+    url: &str,
+    tx: mpsc::UnboundedSender<String>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    reconnect_delay: Duration,
+) -> Result<(WsSession, WsWriteTx)> {
+    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<String>();
+    let url_owned = url.to_string();
+
+    let task = tokio::spawn(async move {
+        loop {
+            // 裸直连（不经 proxy 逻辑）。
+            let ws = match tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio_tungstenite::connect_async(&url_owned),
+            )
+            .await
+            {
+                Ok(Ok((ws, _))) => ws,
+                Ok(Err(e)) => {
+                    eprintln!("[binance-ws] raw connect failed: {e}");
+                    tokio::time::sleep(reconnect_delay).await;
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("[binance-ws] raw connect TIMEOUT to {url_owned}");
+                    tokio::time::sleep(reconnect_delay).await;
+                    continue;
+                }
+            };
+            eprintln!("[binance-ws] connected (raw) to {url_owned}");
+            let (mut write, mut read) = ws.split();
+
+            // 泵循环。
+            loop {
+                tokio::select! {
+                    biased;
+
+                    _ = shutdown_rx.changed() => { return; },
+
+                    _ = &mut close_rx => {
+                        let _ = write.send(Message::Close(None)).await;
+                        return;
+                    },
+
+                    msg = read.next() => {
+                        match msg {
+                            Some(Ok(Message::Text(text))) => {
+                                if tx.send(text.to_string()).is_err() {
+                                    return; // 读侧已关闭
+                                }
+                            }
+                            Some(Ok(Message::Ping(data))) => {
+                                let _ = write.send(Message::Pong(data)).await;
+                            }
+                            Some(Ok(Message::Close(_))) | None => {
+                                break; // 断线，走重连
+                            }
+                            Some(Ok(_)) => {} // Binary, Pong 忽略
+                            Some(Err(_)) => break,
+                        }
+                    }
+
+                    to_send = write_rx.recv() => {
+                        if let Some(msg) = to_send {
+                            if write.send(Message::Text(msg.into())).await.is_err() {
+                                break;
+                            }
+                        } else {
+                            return; // write_tx 已关闭
+                        }
+                    }
+                }
+            }
+            // 断线等待后重连。
+            tokio::time::sleep(reconnect_delay).await;
+        }
+    });
+
+    Ok((WsSession::new(close_tx, task), write_tx))
+}
+
 /// 向 WS 发送 SUBSCRIBE 帧。
 pub(crate) fn subscribe(write: &WsWriteTx, streams: &[String], id: u64) {
     let msg = serde_json::json!({

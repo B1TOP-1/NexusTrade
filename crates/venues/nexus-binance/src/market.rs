@@ -80,20 +80,6 @@ impl BinanceMarket {
         Self::connect(BinanceMarketConfig::testnet()).await
     }
 
-    /// GET depth snapshot + padding (if provided) → DepthSnapshot
-    async fn fetch_snapshot(&self, symbol: &str) -> Result<DepthSnapshot> {
-        let snap: DepthSnapshot = self
-            .http
-            .get(format!("{}/fapi/v1/depth", self.config.rest_url))
-            .query(&[("symbol", symbol), ("limit", "1000")])
-            .send()
-            .await
-            .map_err(|e| NexusError::Transport(format!("depth REST: {e}")))?
-            .json()
-            .await
-            .map_err(|e| NexusError::Transport(format!("depth parse: {e}")))?;
-        Ok(snap)
-    }
 }
 
 #[async_trait]

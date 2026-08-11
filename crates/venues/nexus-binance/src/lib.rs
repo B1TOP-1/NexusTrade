@@ -18,6 +18,6 @@ pub mod ws_exec;
 pub use execution::{BinanceVenue, BinanceVenueConfig};
 pub use market::{BinanceMarket, BinanceMarketConfig};
 pub use ws_exec::WsFapiClient;
-pub use ws::{spawn_reader_with_hook, WireHook};
+pub use ws::{spawn_reader_raw, spawn_reader_with_hook, WireHook};
 
 pub use types::DepthStreamData;

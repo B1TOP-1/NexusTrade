@@ -259,6 +259,44 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 打印 ACCOUNT_UPDATE（仓位 + 余额）。
+fn print_account_update(v: &serde_json::Value) {
+    let a = &v["a"];
+    let e_ms = v["E"].as_i64().unwrap_or(0);
+    let t_ms = v["T"].as_i64().unwrap_or(0);
+    let reason = a["m"].as_str().unwrap_or("?");
+    println!("");
+    println!("    ╔═ WS ACCOUNT_UPDATE ══════════════════════════");
+    println!("    ║ E={} T={} reason={}", e_ms, t_ms, reason);
+    // 余额变化（调试期全打印）
+    if let Some(bs) = a["B"].as_array() {
+        for b in bs {
+            let asset = b["a"].as_str().unwrap_or("?");
+            let wb = b["wb"].as_str().unwrap_or("?");
+            let cw = b["cw"].as_str().unwrap_or("?");
+            let bc = b["bc"].as_str().unwrap_or("0");
+            println!(
+                "    ║ 余额: {} 钱包={} 可用={} 本次变化={}",
+                asset, wb, cw, bc
+            );
+        }
+    }
+    // 仓位变化（调试期全打印）
+    if let Some(ps) = a["P"].as_array() {
+        for p in ps {
+            let sym = p["s"].as_str().unwrap_or("?");
+            let pa = p["pa"].as_str().unwrap_or("?");
+            let ep = p["ep"].as_str().unwrap_or("?");
+            let up = p["up"].as_str().unwrap_or("?");
+            println!(
+                "    ║ 仓位: {} 数量={} 开仓价={} 未实现盈亏={}",
+                sym, pa, ep, up
+            );
+        }
+    }
+    println!("    ╚══════════════════════════════════════════════════");
+}
+
 fn load_dotenv() {
     for p in [".env", "../.env", "../../.env"] {
         let Ok(c) = std::fs::read_to_string(p) else { continue };
@@ -443,10 +481,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text.to_string()) else {
                         continue;
                     };
-                    if v["e"] != "ORDER_TRADE_UPDATE" {
-                        continue;
+                    // 分类处理所有用户流事件
+                    match v["e"].as_str().unwrap_or("?") {
+                        "ORDER_TRADE_UPDATE" => manager_reader.on_order_update(&v),
+                        "ACCOUNT_UPDATE" => print_account_update(&v),
+                        "MARGIN_CALL" => println!("  [WS] MARGIN_CALL: {}", v.to_string()),
+                        "listenKeyExpired" => println!("  [WS] ⚠ listenKeyExpired"),
+                        _ => println!("  [WS] 其他事件: {}", v.to_string()),
                     }
-                    manager_reader.on_order_update(&v);
                 }
                 _ => continue,
             }

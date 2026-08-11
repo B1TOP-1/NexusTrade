@@ -194,6 +194,22 @@ impl WsFapiClient {
         }
         Ok(())
     }
+
+    /// 查询订单状态（order.status）。返回完整响应（含 avgPrice/executedQty/status）。
+    pub async fn query(&self, symbol: &Symbol, order_id: u64) -> Result<serde_json::Value> {
+        let params = vec![
+            ("symbol".to_string(), symbol.venue_native.clone()),
+            ("orderId".to_string(), order_id.to_string()),
+        ];
+        let resp = self.request("order.status", params).await?;
+        if resp["status"].as_i64() != Some(200) {
+            return Err(NexusError::VenueReject {
+                code: "WS_FAPI".into(),
+                msg: resp["error"].to_string(),
+            });
+        }
+        Ok(resp)
+    }
 }
 
 /// TIF + 类型映射（与 REST execution.rs 保持一致）。

@@ -46,3 +46,6 @@ path = "examples/latency_detail.rs"
 [[example]]
 name = "depth_speed_compare"
 path = "examples/depth_speed_compare.rs"
+[[example]]
+name = "taker_test"
+path = "examples/taker_test.rs"

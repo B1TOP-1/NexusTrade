@@ -281,12 +281,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pre_top.bid, pre_top.ask, local_e, local_t,
         );
 
+        // ── 下单前精度校验（SymbolMeta::validate）──
+        // 检查 qty 是否满足 LOT_SIZE/minQty，名义额是否 ≥ MIN_NOTIONAL
+        let meta = market.symbol_meta(&sym)?;
+        let mut qty = args.qty;
+        // 自动量化到 lot 并抬高到 min_qty
+        if qty < meta.min_qty {
+            println!(
+                "    ⚠ qty {} < minQty {}, 自动抬到 {}",
+                qty, meta.min_qty, meta.min_qty
+            );
+            qty = meta.min_qty;
+        }
+        qty = meta.quantize_qty(qty);
+        if qty * pre_top.bid < meta.min_notional {
+            println!(
+                "    ⚠ 名义额 {} < minNotional {}，需 qty ≥ {:.4}",
+                qty * pre_top.bid,
+                meta.min_notional,
+                meta.min_notional / pre_top.bid
+            );
+        }
+
         // 构造市价单（平仓用 reduceOnly）
         let cid = format!("nxtaker{}", i);
         let mut order = NewOrder::market(
             sym.clone(),
             side,
-            args.qty,
+            qty,
             ClientOrderId(cid.clone()),
         );
         if !is_open {

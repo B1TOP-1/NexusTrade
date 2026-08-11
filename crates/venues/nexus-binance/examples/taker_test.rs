@@ -217,7 +217,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 共享 map：cid → 最新 OTU 条目
     let updates: Arc<Mutex<HashMap<String, StreamEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+    let notify = Arc::new(tokio::sync::Notify::new());
     let updates_reader = Arc::clone(&updates);
+    let notify_reader = Arc::clone(&notify);
     tokio::spawn(async move {
         let mut read = user_read;
         loop {
@@ -242,6 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         trade_ms: v["T"].as_i64().unwrap_or(0),
                     };
                     updates_reader.lock().unwrap().insert(cid, entry);
+                    notify_reader.notify_one(); // 事件驱动：通知主循环
                 }
                 _ => continue,
             }
@@ -325,10 +328,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(order_id) => {
                 println!("  市价单已下: orderId={order_id}  ACK={:.2}ms", ack_us / 1000.0);
 
-                // 从共享 map 轮询 FILLED（用户流后台 task 已提前建立）
+                // 事件驱动：等待用户流通知（后台 task 收 OTU 时 notify）
                 let mut confirmed = false;
                 let confirm_deadline = std::time::Instant::now() + Duration::from_secs(10);
-                while std::time::Instant::now() < confirm_deadline {
+                loop {
+                    // 先查 map（可能已到达）
                     let entry = updates.lock().unwrap().get(&cid).cloned();
                     if let Some(e) = entry {
                         if e.status == "FILLED" || e.status == "PARTIALLY_FILLED" {
@@ -369,7 +373,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    // 等用户流通知（事件驱动，不固定 sleep）。超时兜底。
+                    let notified = tokio::time::timeout(
+                        Duration::from_millis(100),
+                        notify.notified(),
+                    )
+                    .await;
+                    if notified.is_err() && std::time::Instant::now() > confirm_deadline {
+                        break;
+                    }
                 }
                 if !confirmed {
                     println!("  用户流确认: 超时（查 order.status 兜底）");

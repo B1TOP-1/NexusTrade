@@ -77,7 +77,8 @@ pub struct BinanceVenue {
 impl BinanceVenue {
     pub async fn connect(config: BinanceVenueConfig) -> Result<Arc<Self>> {
         let http = reqwest::Client::new();
-        let listen_key = ListenKeyGuard::acquire(&http, &config.rest_url).await?;
+        let listen_key =
+            ListenKeyGuard::acquire(&http, &config.rest_url, &config.api_key).await?;
 
         let venue = Arc::new(Self {
             config,
@@ -369,7 +370,7 @@ async fn run_private_loop(
     tx: &mpsc::Sender<AccountEvent>,
 ) -> Result<()> {
     loop {
-        let guard = ListenKeyGuard::acquire(http, &config.rest_url).await?;
+        let guard = ListenKeyGuard::acquire(http, &config.rest_url, &config.api_key).await?;
         let url = config.private_ws_url(guard.key());
         let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<String>();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

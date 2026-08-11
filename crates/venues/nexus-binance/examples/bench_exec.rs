@@ -91,12 +91,23 @@ async fn fetch_reference_prices(
     match client.market().price_ticker(Some(symbol)).await {
         Ok(tickers) if !tickers.is_empty() => {
             let price = tickers[0].price.parse::<f64>().unwrap_or(0.0);
-            Some((price * 0.995, price * 1.005)) // buy 在下方 0.5%，sell 在上方 0.5%
+            let (buy, sell) = (price * 0.995, price * 1.005); // buy 在下方 0.5%，sell 在上方 0.5%
+            Some((quantize_tick(buy), quantize_tick(sell)))
         }
         _ => {
             eprintln!("无法获取 {symbol} 参考价");
             None
         }
+    }
+}
+
+/// 量化价格到 tick（BTC/ETH 等主流是 0.10，回退 0.01）。
+/// 从 exchangeInfo 精确读 tick 成本高，这里用通用规则：按价格量级选 tick。
+fn quantize_tick(price: f64) -> f64 {
+    if price >= 100.0 {
+        (price / 0.10).round() * 0.10
+    } else {
+        (price / 0.01).round() * 0.01
     }
 }
 

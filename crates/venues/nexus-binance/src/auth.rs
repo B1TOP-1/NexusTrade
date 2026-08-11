@@ -37,9 +37,12 @@ pub struct ListenKeyGuard {
 
 impl ListenKeyGuard {
     /// POST /fapi/v1/listenKey 获取 listenKey，并 spawn 每 30min PUT keepalive。
-    pub async fn acquire(client: &reqwest::Client, base_url: &str) -> Result<Self> {
+    ///
+    /// ⚠ Binance 的 listenKey 端点必须带 `X-MBX-APIKEY` header（不需要签名）。
+    pub async fn acquire(client: &reqwest::Client, base_url: &str, api_key: &str) -> Result<Self> {
         let resp: serde_json::Value = client
             .post(format!("{base_url}/fapi/v1/listenKey"))
+            .header("X-MBX-APIKEY", api_key)
             .send()
             .await
             .map_err(|e| NexusError::Transport(format!("listenKey POST: {e}")))?
@@ -49,13 +52,18 @@ impl ListenKeyGuard {
 
         let listen_key = resp["listenKey"]
             .as_str()
-            .ok_or_else(|| NexusError::Transport("listenKey missing in response".into()))?
+            .ok_or_else(|| {
+                NexusError::Transport(format!(
+                    "listenKey missing in response: {resp} (api key header missing?)"
+                ))
+            })?
             .to_string();
 
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         let key = listen_key.clone();
         let c = client.clone();
         let url = base_url.to_string();
+        let api_key_owned = api_key.to_string();
 
         let task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
@@ -65,6 +73,7 @@ impl ListenKeyGuard {
                     _ = interval.tick() => {
                         let _ = c
                             .put(format!("{url}/fapi/v1/listenKey"))
+                            .header("X-MBX-APIKEY", &api_key_owned)
                             .header("Content-Type", "application/x-www-form-urlencoded")
                             .body(format!("listenKey={key}"))
                             .send()

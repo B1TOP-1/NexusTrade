@@ -272,6 +272,8 @@ async fn place_and_cancel(
     } else {
         reference * (1.0 + offset_pct / 100.0)
     };
+    // 量化到 tick（0.10），避免 -1111 精度超限。
+    let price = (price / 0.10).round() * 0.10;
     let price_str = format!("{price:.2}");
     let qty_str = format!("{qty}");
 

@@ -484,6 +484,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // 分类处理所有用户流事件
                     match v["e"].as_str().unwrap_or("?") {
                         "ORDER_TRADE_UPDATE" => manager_reader.on_order_update(&v),
+                        "TRADE_LITE" => {
+                            // 私有成交轻量版（最快成交信号）
+                            println!(
+                                "  [WS] TRADE_LITE 私有成交: {} {}@{}{} 成交ID={}",
+                                v["S"].as_str().unwrap_or("?"),
+                                v["l"].as_str().unwrap_or("?"),
+                                v["L"].as_str().unwrap_or("?"),
+                                if v["m"].as_bool().unwrap_or(false) {
+                                    " (被动)"
+                                } else {
+                                    " (主动)"
+                                },
+                                v["t"].as_str().unwrap_or("?"),
+                            );
+                        }
                         "ACCOUNT_UPDATE" => print_account_update(&v),
                         "ACCOUNT_CONFIG_UPDATE" => {
                             let ac = &v["ac"];
@@ -510,7 +525,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                         "listenKeyExpired" => println!("  [WS] ⚠ listenKeyExpired"),
-                        _ => println!("  [WS] 其他事件: {}", v.to_string()),
+                        _ => {} // 未知事件静默（调试期已确认无遗漏）
                     }
                 }
                 _ => continue,

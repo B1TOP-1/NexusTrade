@@ -619,9 +619,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             String::new()
                         };
                         println!(
-                            "[成交] {} {} @ {} 滑点{:.2}%{} 余额={} 仓位={}",
+                            "[成交] {} {} {} @ {} 滑点{:.2}%{} 余额={} 仓位={}",
                             if final_state.status == OrderStatus::Filled { "FILLED" } else { final_state.status.as_str() },
                             if is_open { "BUY" } else { "SELL" },
+                            final_state.executed_qty,
                             final_state.avg_price,
                             slippage_pct,
                             fee_str,

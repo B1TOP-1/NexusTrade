@@ -31,6 +31,10 @@ pub struct BinanceMarketConfig {
     pub ws_url: String,
     pub rest_url: String,
     pub reconnect_delay: Duration,
+    /// depth diff 流更新速度。`@depth@100ms` / `@depth@250ms` /
+    /// `@depth@0ms`（尽可能实时推送，实测可用，非固定 0ms）。
+    /// 默认 100ms，可用环境变量 `BINANCE_FUTURES_DEPTH_UPDATE_SPEED` 覆盖。
+    pub depth_speed: String,
 }
 
 impl Default for BinanceMarketConfig {
@@ -39,6 +43,8 @@ impl Default for BinanceMarketConfig {
             ws_url: "wss://fstream.binance.com/ws".to_string(),
             rest_url: "https://fapi.binance.com".to_string(),
             reconnect_delay: Duration::from_millis(500),
+            depth_speed: std::env::var("BINANCE_FUTURES_DEPTH_UPDATE_SPEED")
+                .unwrap_or_else(|_| "100ms".to_string()),
         }
     }
 }
@@ -49,6 +55,8 @@ impl BinanceMarketConfig {
             ws_url: "wss://stream.binancefuture.com/ws".to_string(),
             rest_url: "https://testnet.binancefuture.com".to_string(),
             reconnect_delay: Duration::from_millis(500),
+            depth_speed: std::env::var("BINANCE_FUTURES_DEPTH_UPDATE_SPEED")
+                .unwrap_or_else(|_| "100ms".to_string()),
         }
     }
 }
@@ -102,8 +110,13 @@ impl MarketVenue for BinanceMarket {
         let (session, write_tx) =
             ws::spawn_reader(&ws_url, tx, shutdown_rx, reconnect_delay).await?;
 
-        // 订阅 depth diff 流（fastest=true → 100ms，否则 250ms）。
-        let speed = if opts.fastest { "100ms" } else { "250ms" };
+        // 订阅 depth diff 流。优先用 config.depth_speed（可配 0ms 实时推送），
+        // 未配置时回退 fastest=true → 100ms，否则 250ms。
+        let speed = if self.config.depth_speed.is_empty() {
+            if opts.fastest { "100ms" } else { "250ms" }.to_string()
+        } else {
+            self.config.depth_speed.clone()
+        };
         ws::subscribe(
             &write_tx,
             &[format!("{}@depth@{}", venue_native.to_lowercase(), speed)],

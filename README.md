@@ -58,8 +58,11 @@
 ## 运行示例
 
 ```bash
-# 本地订单簿（行情，100ms）
+# 本地订单簿（行情，默认 100ms）
 cargo run -p nexus-binance --example live_book -- BTCUSDT 300
+
+# 本地订单簿（0ms 尽可能实时推送，~3 倍事件密度）
+BINANCE_FUTURES_DEPTH_UPDATE_SPEED=0ms cargo run -p nexus-binance --example live_book -- BTCUSDT 300
 
 # WS 下单验证（post-only 不成交）
 cargo run -p nexus-binance --example ws_place

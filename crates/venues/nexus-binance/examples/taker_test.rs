@@ -45,6 +45,8 @@ enum OrderStatus {
     Expired,
     /// 已拒绝（终态，优先级 3）
     Rejected,
+    /// 未知（初始状态：下单前未收到任何事件）。
+    Unknown,
 }
 
 impl OrderStatus {
@@ -56,7 +58,7 @@ impl OrderStatus {
             "CANCELED" => OrderStatus::Canceled,
             "EXPIRED" => OrderStatus::Expired,
             "REJECTED" => OrderStatus::Rejected,
-            _ => OrderStatus::New,
+            _ => OrderStatus::Unknown,
         }
     }
 
@@ -79,6 +81,7 @@ impl OrderStatus {
             OrderStatus::Canceled => "CANCELED",
             OrderStatus::Expired => "EXPIRED",
             OrderStatus::Rejected => "REJECTED",
+            OrderStatus::Unknown => "UNKNOWN",
         }
     }
 }
@@ -114,7 +117,7 @@ impl OrderState {
     fn new(cid: &str) -> Self {
         Self {
             client_order_id: cid.to_string(),
-            status: OrderStatus::New,
+            status: OrderStatus::Unknown,
             orig_qty: Decimal::ZERO,
             executed_qty: Decimal::ZERO,
             avg_price: Decimal::ZERO,

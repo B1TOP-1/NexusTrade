@@ -19,10 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nexus_binance::auth::sign;
-use nexus_binance::{BinanceVenue, BinanceVenueConfig};
-use nexus_core::{
-    ClientOrderId, ExecutionVenue, NewOrder, OrderRef, Side, Symbol,
-};
+use nexus_core::{ClientOrderId, Decimal, NewOrder, Side, Symbol};
 use tokio::sync::{mpsc, oneshot};
 use rust_decimal_macros::dec;
 
@@ -365,17 +362,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("    用户流自检: ⚠ 2s 内无消息（可能连接未通）");
     }
 
-    // 连接 REST venue（下单/撤单 REST 通道）
-    println!("[3] 连接 REST venue...");
-    let rest_config = if args.testnet {
-        BinanceVenueConfig::testnet(key.clone(), secret.clone())
-    } else {
-        BinanceVenueConfig::mainnet(key.clone(), secret.clone())
-    };
-    let venue = BinanceVenue::connect(rest_config)
-        .await
-        .map_err(|e| format!("REST venue connect: {e}"))?;
-    println!("    连接成功 ✓");
+    // REST 通道：纯 reqwest 签名下单（不 acquire listenKey，避免抢占用户流）
+    println!("[3] 准备 REST 通道 (reqwest 签名)...");
+    let http = reqwest::Client::new();
+    println!("    准备完成 ✓");
 
     let sym = Symbol::new(
         args.symbol.replace("USDT", ""),
@@ -487,24 +477,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ═══ REST 通道 ═══
         println!("  ── REST 通道 ──");
         let rest_cid = ClientOrderId(format!("nxr{}", i));
-        let rest_order = NewOrder::limit(
-            sym.clone(),
-            Side::Buy,
-            price,
-            dec!(0.001),
-            rest_cid.clone(),
-        )
-        .post_only();
 
+        // REST 下单（纯 reqwest 签名，不 acquire listenKey）
         let t_r_start = Instant::now();
         let t_r0 = now_ms();
-        let rest_ack = venue.place(rest_order).await;
+        let rest_result = rest_place(
+            &http,
+            rest_url,
+            &key,
+            &secret,
+            &args.symbol,
+            &rest_cid.0,
+            price,
+        )
+        .await;
         let rest_ack_wall = t_r_start.elapsed().as_secs_f64() * 1000.0;
 
-        match rest_ack {
-            Ok(ack) => {
+        match rest_result {
+            Ok(rest_oid) => {
                 push(&mut s, "REST策略→ACK", rest_ack_wall);
-                let rest_oid = ack.venue_order_id.clone().unwrap_or_default();
                 println!(
                     "  下单: status=200 策略→ACK={rest_ack_wall:.2}ms orderId={rest_oid}"
                 );
@@ -527,12 +518,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // 撤单
                 let t_cr = now_ms();
                 let t_crs = Instant::now();
-                let ref_ = OrderRef {
-                    symbol: sym.clone(),
-                    client_id: rest_cid.clone(),
-                    venue_order_id: ack.venue_order_id,
-                };
-                let cancel_r = venue.cancel(&ref_).await;
+                let cancel_r = rest_cancel(&http, rest_url, &key, &secret, &args.symbol, rest_oid).await;
                 let cr_wall = t_crs.elapsed().as_secs_f64() * 1000.0;
                 let cr_status = if cancel_r.is_ok() { 200 } else { -1 };
                 println!("  撤单: status={cr_status} 发起→ACK={cr_wall:.2}ms");
@@ -581,6 +567,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     s["撤单发起→CANCELED"].report("撤单发起→CANCELED (全链路)");
     println!("{}", "=".repeat(72));
 
+    Ok(())
+}
+
+/// REST 下单（纯 reqwest 签名，不 acquire listenKey）。返回 orderId。
+async fn rest_place(
+    http: &reqwest::Client,
+    rest_url: &str,
+    api_key: &str,
+    api_secret: &str,
+    symbol: &str,
+    client_order_id: &str,
+    price: Decimal,
+) -> Result<u64, String> {
+    let ts = chrono::Utc::now().timestamp_millis();
+    let mut params = vec![
+        ("symbol", symbol.to_string()),
+        ("side", "BUY".to_string()),
+        ("type", "LIMIT".to_string()),
+        ("timeInForce", "GTX".to_string()),
+        ("quantity", "0.001".to_string()),
+        ("price", price.to_string()),
+        ("newClientOrderId", client_order_id.to_string()),
+        ("timestamp", ts.to_string()),
+    ];
+    params.sort_by(|a, b| a.0.cmp(&b.0));
+    let query = params
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let sig = sign(&query, api_secret);
+    let full = format!("{query}&signature={sig}");
+
+    let resp = http
+        .post(format!("{rest_url}/fapi/v1/order"))
+        .header("X-MBX-APIKEY", api_key)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(full)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    if v["orderId"].is_null() {
+        return Err(format!("REST order failed: {v}"));
+    }
+    v["orderId"].as_u64().ok_or_else(|| "missing orderId".to_string())
+}
+
+/// REST 撤单。返回 orderId。
+async fn rest_cancel(
+    http: &reqwest::Client,
+    rest_url: &str,
+    api_key: &str,
+    api_secret: &str,
+    symbol: &str,
+    order_id: u64,
+) -> Result<(), String> {
+    let ts = chrono::Utc::now().timestamp_millis();
+    let mut params = vec![
+        ("symbol", symbol.to_string()),
+        ("orderId", order_id.to_string()),
+        ("timestamp", ts.to_string()),
+    ];
+    params.sort_by(|a, b| a.0.cmp(&b.0));
+    let query = params
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let sig = sign(&query, api_secret);
+    let full = format!("{query}&signature={sig}");
+
+    let resp = http
+        .delete(format!("{rest_url}/fapi/v1/order"))
+        .header("X-MBX-APIKEY", api_key)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(full)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    if v["status"].as_str().is_none() {
+        return Err(format!("REST cancel failed: {v}"));
+    }
     Ok(())
 }
 

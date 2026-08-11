@@ -30,23 +30,26 @@ use rust_decimal_macros::dec;
 // 订单状态机（状态只向前推进）
 // ═══════════════════════════════════════════════════════════════
 
-/// 状态优先级：只允许前进，禁止倒退。
+/// 订单状态机（状态只允许前进，禁止倒退）。
+/// 枚举顺序 = 状态优先级：高的状态只能从低的推进来。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum OrderStatus {
-    /// 挂单（优先级 1）
-    New,
-    /// 部分成交（优先级 2）
-    PartiallyFilled,
-    /// 全部成交（终态，优先级 3）
-    Filled,
-    /// 已撤销（终态，优先级 3）
-    Canceled,
-    /// 已过期（终态，优先级 3）
-    Expired,
-    /// 已拒绝（终态，优先级 3）
-    Rejected,
-    /// 未知（初始状态：下单前未收到任何事件）。
+    /// 未出网：策略本地构造，尚未发送（优先级最低，初始态）。
+    PendingSubmit,
+    /// 已发送未确认：交易所未回任何事件。
     Unknown,
+    /// 已受理挂单：交易所确认收到（NEW）。
+    New,
+    /// 部分成交。
+    PartiallyFilled,
+    /// 全部成交（终态）。
+    Filled,
+    /// 已撤销（终态，可能带部分成交）。
+    Canceled,
+    /// 已过期（终态）。
+    Expired,
+    /// 已拒绝（终态，无敞口）。
+    Rejected,
 }
 
 impl OrderStatus {
@@ -75,13 +78,14 @@ impl OrderStatus {
 
     fn as_str(&self) -> &'static str {
         match self {
+            OrderStatus::PendingSubmit => "PENDING_SUBMIT",
+            OrderStatus::Unknown => "UNKNOWN",
             OrderStatus::New => "NEW",
             OrderStatus::PartiallyFilled => "PARTIALLY_FILLED",
             OrderStatus::Filled => "FILLED",
             OrderStatus::Canceled => "CANCELED",
             OrderStatus::Expired => "EXPIRED",
             OrderStatus::Rejected => "REJECTED",
-            OrderStatus::Unknown => "UNKNOWN",
         }
     }
 }
@@ -117,7 +121,7 @@ impl OrderState {
     fn new(cid: &str) -> Self {
         Self {
             client_order_id: cid.to_string(),
-            status: OrderStatus::Unknown,
+            status: OrderStatus::PendingSubmit,
             orig_qty: Decimal::ZERO,
             executed_qty: Decimal::ZERO,
             avg_price: Decimal::ZERO,
@@ -582,29 +586,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             order = order.reduce_only();
         }
 
-        // 下单
+        // 下单：t_start = 策略开始 → place 返回 = ACK
         let t_start = std::time::Instant::now();
         let result = fapi.place(&order).await;
-        let ack_us = t_start.elapsed().as_micros() as f64;
+        let ack_us = t_start.elapsed().as_micros() as f64; // 策略→ACK
         ack_latency.push(ack_us);
 
         match result {
             Ok(order_id) => {
-                println!("  市价单已下: orderId={order_id}  ACK={:.2}ms", ack_us / 1000.0);
+                println!(
+                    "  市价单已下: orderId={order_id}  策略→ACK={:.2}ms",
+                    ack_us / 1000.0
+                );
 
                 // 等终态（OrderManager 只在 FILLED/CANCELED/EXPIRED/REJECTED resolve）
                 match tokio::time::timeout(Duration::from_secs(10), fill_rx).await {
                     Ok(Ok(final_state)) => {
+                        // 全链路 = 策略→FILLED 确认；ACK→FILLED = 全链路 - ACK
                         let fill_us = t_start.elapsed().as_micros() as f64;
+                        let ack_to_fill_us = fill_us - ack_us;
                         fill_latency.push(fill_us);
                         let now = now_ms();
                         let order_local_e = now - final_state.transitions.last().unwrap().gateway_ms;
                         let order_local_t = now - final_state.transitions.last().unwrap().trade_ms;
 
                         println!(
-                            "  终态确认: {} 下单→终态={:.2}ms local-E={}ms local-T={}ms",
+                            "  终态确认: {}  策略→FILLED={:.2}ms  [ACK→FILLED={:.2}ms]  local-E={}ms local-T={}ms",
                             final_state.status.as_str(),
                             fill_us / 1000.0,
+                            ack_to_fill_us / 1000.0,
                             order_local_e,
                             order_local_t,
                         );
@@ -676,9 +686,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (e_min, e_avg, e_max) = sum(&book_local_e);
     let (t_min, t_avg, t_max) = sum(&book_local_t);
     let (s_min, s_avg, s_max) = sum(&slippages);
-    println!("  市价单 ACK:  min={:.2}ms avg={:.2}ms max={:.2}ms", a_min / 1000.0, a_avg / 1000.0, a_max / 1000.0);
+    println!("  策略→ACK (发出):   min={:.2}ms avg={:.2}ms max={:.2}ms", a_min / 1000.0, a_avg / 1000.0, a_max / 1000.0);
     if !fill_latency.is_empty() {
-        println!("  下单→终态: min={:.2}ms avg={:.2}ms max={:.2}ms", f_min / 1000.0, f_avg / 1000.0, f_max / 1000.0);
+        println!("  策略→FILLED (全链路): min={:.2}ms avg={:.2}ms max={:.2}ms", f_min / 1000.0, f_avg / 1000.0, f_max / 1000.0);
+        println!("  其中 ACK→FILLED (撮合+推送): ≈ 全链路 − ACK");
     }
     println!("  0ms簿 local-E: min={:.2}ms avg={:.2}ms max={:.2}ms", e_min, e_avg, e_max);
     println!("  0ms簿 local-T: min={:.2}ms avg={:.2}ms max={:.2}ms", t_min, t_avg, t_max);

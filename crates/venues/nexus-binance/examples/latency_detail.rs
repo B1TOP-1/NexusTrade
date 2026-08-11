@@ -91,28 +91,39 @@ impl Stats {
     fn new() -> Self {
         Self { samples: Vec::new() }
     }
-    fn push(&mut self, ms: f64) {
-        self.samples.push(ms);
+    fn push_us(&mut self, us: f64) {
+        self.samples.push(us);
+    }
+    /// 智能显示：>=1ms 显示 ms，<1ms 显示 us。
+    fn fmt(val: f64) -> String {
+        if val >= 1000.0 {
+            format!("{:.2}ms", val / 1000.0)
+        } else {
+            format!("{:.1}us", val)
+        }
     }
     fn report(&self, label: &str) {
         if self.samples.is_empty() {
-            println!("  {label:<28} 无样本");
+            println!("  {label:<30} 无样本");
             return;
         }
         let min = self.samples.iter().cloned().fold(f64::MAX, f64::min);
         let max = self.samples.iter().cloned().fold(0.0, f64::max);
         let avg = self.samples.iter().sum::<f64>() / self.samples.len() as f64;
         println!(
-            "  {label:<28} min={min:>8.2}  avg={avg:>8.2}  max={max:>8.2}  (n={})",
+            "  {label:<30} min={:<10} avg={:<10} max={:<10}  (n={})",
+            Self::fmt(min),
+            Self::fmt(avg),
+            Self::fmt(max),
             self.samples.len()
         );
     }
 }
 
-/// 往统计表 push 一个样本。
-fn push(s: &mut HashMap<&str, Stats>, label: &str, value: f64) {
+/// 往统计表 push 一个 us 样本。
+fn push(s: &mut HashMap<&str, Stats>, label: &str, value_us: f64) {
     if let Some(stats) = s.get_mut(label) {
-        stats.push(value);
+        stats.push_us(value_us);
     }
 }
 
@@ -123,8 +134,8 @@ struct FapiTracer {
     api_key: String,
     api_secret: String,
     id_counter: AtomicU64,
-    /// 网卡推出时刻（hook 写入，本地 epoch ms）
-    wire_ts: Arc<Mutex<i64>>,
+    /// 网卡推出时刻（hook 写入，monotonic Instant，us 精度）
+    wire_ts: Arc<Mutex<Option<Instant>>>,
 }
 
 impl FapiTracer {
@@ -137,12 +148,12 @@ impl FapiTracer {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let wire_ts: Arc<Mutex<i64>> = Arc::new(Mutex::new(0));
+        let wire_ts: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
-        // 网卡 hook：记录每次发送的真实时刻
+        // 网卡 hook：记录每次发送的真实时刻（Instant，us 精度）
         let wire_ts_hook = Arc::clone(&wire_ts);
         let hook: ws::WireHook = Arc::new(move |_msg| {
-            *wire_ts_hook.lock().unwrap() = now_ms();
+            *wire_ts_hook.lock().unwrap() = Some(Instant::now());
         });
 
         let (session, write_tx) = ws::spawn_reader_with_hook(
@@ -184,12 +195,12 @@ impl FapiTracer {
         })
     }
 
-    /// 签名请求。返回 (响应, 网卡推出时刻)。
+    /// 签名请求。返回 (响应, 网卡推出时刻 Instant)。
     async fn request(
         &self,
         method: &str,
         params: Vec<(String, String)>,
-    ) -> Result<(serde_json::Value, i64), String> {
+    ) -> Result<(serde_json::Value, Option<Instant>), String> {
         let req_id = format!("trc-{}", self.id_counter.fetch_add(1, Ordering::Relaxed));
 
         let mut all = params;
@@ -214,7 +225,7 @@ impl FapiTracer {
         let payload = serde_json::json!({"id": req_id, "method": method, "params": params_map});
 
         // 清零网卡时刻，标记发送前
-        *self.wire_ts.lock().unwrap() = 0;
+        *self.wire_ts.lock().unwrap() = None;
         self.write_tx.send(payload.to_string()).map_err(|e| e.to_string())?;
 
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -224,7 +235,10 @@ impl FapiTracer {
         Ok((resp, wire))
     }
 
-    async fn place(&self, order: &NewOrder) -> Result<(serde_json::Value, i64), String> {
+    async fn place(
+        &self,
+        order: &NewOrder,
+    ) -> Result<(serde_json::Value, Option<Instant>), String> {
         let mut params = vec![
             ("symbol".to_string(), order.symbol.venue_native.clone()),
             ("side".to_string(), format!("{:?}", order.side).to_uppercase()),
@@ -240,7 +254,11 @@ impl FapiTracer {
         self.request("order.place", params).await
     }
 
-    async fn cancel(&self, symbol: &str, order_id: u64) -> Result<(serde_json::Value, i64), String> {
+    async fn cancel(
+        &self,
+        symbol: &str,
+        order_id: u64,
+    ) -> Result<(serde_json::Value, Option<Instant>), String> {
         let params = vec![
             ("symbol".to_string(), symbol.to_string()),
             ("orderId".to_string(), order_id.to_string()),
@@ -353,7 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 连接用户数据流（裸连接，已验证通）
     println!("[2] 连接用户数据流 (listenKey)...");
-    let (mut user_write, mut user_read) = connect_user_stream_raw(&key, rest_url).await?;
+    let (_user_write, mut user_read) = connect_user_stream_raw(&key, rest_url).await?;
     println!("    连接成功 ✓");
     println!("    用户流自检: 裸连接建立 ✓ (等待订单事件推送)");
 
@@ -409,60 +427,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .post_only();
 
         let t_ws_start = Instant::now();
-        let t_ws0 = now_ms();
         let (ws_resp, ws_wire) = fapi.place(&ws_order).await?;
-        let t_ws_ack = now_ms();
-        let ws_ack_wall = t_ws_start.elapsed().as_secs_f64() * 1000.0;
+        let t_ws_ack = Instant::now();
+        let ws_ack_wall_us = t_ws_start.elapsed().as_micros() as f64;
 
-        let ws_local = if ws_wire > 0 { ws_wire - t_ws0 } else { 0 };
-        let ws_wire_ack = if ws_wire > 0 { t_ws_ack - ws_wire } else { 0 };
+        // us 精度：策略→网卡 和 网卡→ACK
+        let ws_local_us = match ws_wire {
+            Some(w) => w.duration_since(t_ws_start).as_micros() as f64,
+            None => 0.0,
+        };
+        let ws_wire_ack_us = match ws_wire {
+            Some(w) => t_ws_ack.duration_since(w).as_micros() as f64,
+            None => 0.0,
+        };
         let ws_status = ws_resp["status"].as_i64().unwrap_or(-1);
         println!(
-            "  下单: status={ws_status} 策略→网卡={ws_local}ms 网卡→ACK={ws_wire_ack}ms 策略→ACK={ws_ack_wall:.2}ms"
+            "  下单: status={ws_status} 策略→网卡={ws_local_us:.0}us 网卡→ACK={ws_wire_ack_us:.0}us 策略→ACK={ws_ack_wall_us:.0}us"
         );
         if ws_status != 200 {
             println!("    下单失败: {}", ws_resp["error"]);
         } else {
-            push(&mut s, "WS策略→网卡", ws_local as f64);
-            push(&mut s, "WS网卡→ACK", ws_wire_ack as f64);
-            push(&mut s, "WS策略→ACK", ws_ack_wall);
+            push(&mut s, "WS策略→网卡", ws_local_us);
+            push(&mut s, "WS网卡→ACK", ws_wire_ack_us);
+            push(&mut s, "WS策略→ACK", ws_ack_wall_us);
 
             let ws_order_id = ws_resp["result"]["orderId"].as_u64().unwrap_or(0);
-            // 用户流 NEW 确认 + local-E/T
+            // 用户流 NEW 确认 + local-E/T（local_recv 时刻用 Instant）
             if let Some(c) = wait_for_order_status(&mut user_read, &ws_cid.0, &["NEW", "PARTIALLY_FILLED"]).await {
-                let ws_to_new = c.local_recv_ms - t_ws0;
-                let local_e = c.local_recv_ms - c.gateway_ms;
-                let local_t = c.local_recv_ms - c.trade_ms;
+                let ws_to_new_us = t_ws_start.elapsed().as_micros() as f64;
+                let local_e_us = (now_ms() - c.gateway_ms) as f64;
+                let local_t_us = (now_ms() - c.trade_ms) as f64;
                 println!(
-                    "  NEW(用户流): 策略→NEW={ws_to_new}ms local-E={local_e}ms local-T={local_t}ms (status={})",
+                    "  NEW(用户流): 策略→NEW={ws_to_new_us:.0}us local-E={local_e_us:.0}us local-T={local_t_us:.0}us (status={})",
                     c.status
                 );
-                push(&mut s, "WS策略→NEW", ws_to_new as f64);
-                push(&mut s, "WS local-E", local_e as f64);
-                push(&mut s, "WS local-T", local_t as f64);
+                push(&mut s, "WS策略→NEW", ws_to_new_us);
+                push(&mut s, "WS local-E", local_e_us);
+                push(&mut s, "WS local-T", local_t_us);
             } else {
                 println!("  NEW(用户流): 超时未收到");
             }
 
             // 撤单
-            let t_c0 = now_ms();
             let t_cs = Instant::now();
             let (cresp, c_wire) = fapi.cancel(&args.symbol, ws_order_id).await?;
-            let t_cack = now_ms();
-            let c_local = if c_wire > 0 { c_wire - t_c0 } else { 0 };
-            let c_wack = if c_wire > 0 { t_cack - c_wire } else { 0 };
-            let c_wall = t_cs.elapsed().as_secs_f64() * 1000.0;
+            let t_cack = Instant::now();
+            let c_local_us = match c_wire {
+                Some(w) => w.duration_since(t_cs).as_micros() as f64,
+                None => 0.0,
+            };
+            let c_wack_us = match c_wire {
+                Some(w) => t_cack.duration_since(w).as_micros() as f64,
+                None => 0.0,
+            };
+            let c_wall_us = t_cs.elapsed().as_micros() as f64;
             let cstatus = cresp["status"].as_i64().unwrap_or(-1);
             println!(
-                "  撤单: status={cstatus} 发起→网卡={c_local}ms 网卡→ACK={c_wack}ms 发起→ACK={c_wall:.2}ms"
+                "  撤单: status={cstatus} 发起→网卡={c_local_us:.0}us 网卡→ACK={c_wack_us:.0}us 发起→ACK={c_wall_us:.0}us"
             );
             if cstatus == 200 {
-                push(&mut s, "WS撤单→网卡", c_local as f64);
-                push(&mut s, "WS网卡→撤单ACK", c_wack as f64);
-                if let Some(cc) = wait_for_order_status(&mut user_read, &ws_cid.0, &["CANCELED"]).await {
-                    let c0_to_c = cc.local_recv_ms - t_c0;
-                    println!("  CANCELED(用户流): 发起→CANCELED={c0_to_c}ms");
-                    push(&mut s, "WS发起→CANCELED", c0_to_c as f64);
+                push(&mut s, "WS撤单→网卡", c_local_us);
+                push(&mut s, "WS网卡→撤单ACK", c_wack_us);
+                if let Some(_cc) = wait_for_order_status(&mut user_read, &ws_cid.0, &["CANCELED"]).await {
+                    let c0_to_c_us = t_cs.elapsed().as_micros() as f64;
+                    println!("  CANCELED(用户流): 发起→CANCELED={c0_to_c_us:.0}us");
+                    push(&mut s, "WS发起→CANCELED", c0_to_c_us);
                 } else {
                     println!("  CANCELED(用户流): 超时未收到");
                 }
@@ -475,7 +504,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // REST 下单（纯 reqwest 签名，不 acquire listenKey）
         let t_r_start = Instant::now();
-        let t_r0 = now_ms();
         let rest_result = rest_place(
             &http,
             rest_url,
@@ -486,43 +514,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             price,
         )
         .await;
-        let rest_ack_wall = t_r_start.elapsed().as_secs_f64() * 1000.0;
+        let rest_ack_wall_us = t_r_start.elapsed().as_micros() as f64;
 
         match rest_result {
             Ok(rest_oid) => {
-                push(&mut s, "REST策略→ACK", rest_ack_wall);
+                push(&mut s, "REST策略→ACK", rest_ack_wall_us);
                 println!(
-                    "  下单: status=200 策略→ACK={rest_ack_wall:.2}ms orderId={rest_oid}"
+                    "  下单: status=200 策略→ACK={rest_ack_wall_us:.0}us orderId={rest_oid}"
                 );
                 // 用户流 NEW 确认 + local-E/T
                 if let Some(c) = wait_for_order_status(&mut user_read, &rest_cid.0, &["NEW", "PARTIALLY_FILLED"]).await {
-                    let r_to_new = c.local_recv_ms - t_r0;
-                    let local_e = c.local_recv_ms - c.gateway_ms;
-                    let local_t = c.local_recv_ms - c.trade_ms;
+                    let r_to_new_us = t_r_start.elapsed().as_micros() as f64;
+                    let local_e_us = (now_ms() - c.gateway_ms) as f64;
+                    let local_t_us = (now_ms() - c.trade_ms) as f64;
                     println!(
-                        "  NEW(用户流): 策略→NEW={r_to_new}ms local-E={local_e}ms local-T={local_t}ms (status={})",
+                        "  NEW(用户流): 策略→NEW={r_to_new_us:.0}us local-E={local_e_us:.0}us local-T={local_t_us:.0}us (status={})",
                         c.status
                     );
-                    push(&mut s, "REST策略→NEW", r_to_new as f64);
-                    push(&mut s, "REST local-E", local_e as f64);
-                    push(&mut s, "REST local-T", local_t as f64);
+                    push(&mut s, "REST策略→NEW", r_to_new_us);
+                    push(&mut s, "REST local-E", local_e_us);
+                    push(&mut s, "REST local-T", local_t_us);
                 } else {
                     println!("  NEW(用户流): 超时未收到");
                 }
 
                 // 撤单
-                let t_cr = now_ms();
                 let t_crs = Instant::now();
                 let cancel_r = rest_cancel(&http, rest_url, &key, &secret, &args.symbol, rest_oid).await;
-                let cr_wall = t_crs.elapsed().as_secs_f64() * 1000.0;
+                let cr_wall_us = t_crs.elapsed().as_micros() as f64;
                 let cr_status = if cancel_r.is_ok() { 200 } else { -1 };
-                println!("  撤单: status={cr_status} 发起→ACK={cr_wall:.2}ms");
+                println!("  撤单: status={cr_status} 发起→ACK={cr_wall_us:.0}us");
                 if cancel_r.is_ok() {
-                    push(&mut s, "REST撤单→ACK", cr_wall);
-                    if let Some(cc) = wait_for_order_status(&mut user_read, &rest_cid.0, &["CANCELED"]).await {
-                        let c0_to_c = cc.local_recv_ms - t_cr;
-                        println!("  CANCELED(用户流): 发起→CANCELED={c0_to_c}ms");
-                        push(&mut s, "REST发起→CANCELED", c0_to_c as f64);
+                    push(&mut s, "REST撤单→ACK", cr_wall_us);
+                    if let Some(_cc) = wait_for_order_status(&mut user_read, &rest_cid.0, &["CANCELED"]).await {
+                        let c0_to_c_us = t_crs.elapsed().as_micros() as f64;
+                        println!("  CANCELED(用户流): 发起→CANCELED={c0_to_c_us:.0}us");
+                        push(&mut s, "REST发起→CANCELED", c0_to_c_us);
                     } else {
                         println!("  CANCELED(用户流): 超时未收到");
                     }
@@ -534,7 +561,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 汇总 ──
     println!("\n{}", "=".repeat(72));
-    println!("  延迟汇总 (ms, 只统计成功)");
+    println!("  延迟汇总 (us/ms 自动切换, 只统计成功)");
     println!("{}", "=".repeat(72));
     println!("  ── WS 下单链路 ──");
     s["WS策略→网卡"].report("WS 策略→网卡 (本地)");
@@ -555,11 +582,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ── REST 撤单链路 ──");
     s["REST撤单→ACK"].report("REST 撤单发起→ACK");
     s["REST发起→CANCELED"].report("REST 发起→用户流CANCELED");
-    println!("  ── 撤单链路 ──");
-    s["撤单发起→网卡"].report("撤单发起→网卡推出 (本地)");
-    s["网卡→撤单ACK"].report("网卡→撤单ACK (网络)");
-    s["撤单ACK→CANCELED"].report("撤单ACK→用户流CANCELED");
-    s["撤单发起→CANCELED"].report("撤单发起→CANCELED (全链路)");
     println!("{}", "=".repeat(72));
 
     Ok(())
@@ -651,8 +673,6 @@ async fn rest_cancel(
 
 /// 用户流订单确认结果：含事件时间戳。
 struct StreamConfirm {
-    /// 本地收到时刻（ms epoch）。
-    local_recv_ms: i64,
     /// 交易所事件时间 E（用户流推送时刻）。
     gateway_ms: i64,
     /// 交易所交易时间 T（撮合时刻）。
@@ -690,7 +710,6 @@ async fn wait_for_order_status(
             let st = o["X"].as_str().unwrap_or("");
             if statuses.contains(&st) {
                 return Some(StreamConfirm {
-                    local_recv_ms: now_ms(),
                     gateway_ms: v["E"].as_i64().unwrap_or(0),
                     trade_ms: v["T"].as_i64().unwrap_or(0),
                     status: st.to_string(),

@@ -277,11 +277,9 @@ async fn run_book_loop(
             if apply_idx > 0 {
                 need_snapshot = false;
                 need_bridge = false;
-                eprintln!("[binance-book] snapshot ready: id={snapshot_id}, bridged, buf={}", buffer.len());
             } else {
                 need_snapshot = false;
                 need_bridge = true;
-                eprintln!("[binance-book] snapshot ready: id={snapshot_id}, waiting for bridge, buf={}", buffer.len());
             }
         }
 
@@ -328,7 +326,6 @@ async fn run_book_loop(
                     last_u = delta.final_update_id;
                     buffer.clear();
                     need_bridge = false;
-                    eprintln!("[binance-book] bridged, last_u={}", last_u);
                     continue;
                 }
                 // 事件已跳过快照窗口（U > last_u+1）→ 错过了桥接 → 重建快照

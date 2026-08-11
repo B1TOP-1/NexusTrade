@@ -64,7 +64,6 @@ pub(crate) async fn spawn_reader(
     let url_owned = url.to_string();
 
     let task = tokio::spawn(async move {
-        eprintln!("[binance-ws] reader task started");
         loop {
             // 连接（10s 超时，避免 DNS/TCP/TLS 无限挂起）。
             let ws = match tokio::time::timeout(
@@ -85,7 +84,6 @@ pub(crate) async fn spawn_reader(
                     continue;
                 }
             };
-            eprintln!("[binance-ws] connected to {url_owned}");
             let (mut write, mut read) = ws.split();
 
             // 泵循环。
@@ -170,10 +168,7 @@ async fn connect_with_proxy(
 
     // ── 1. 先试直连 ──
     match tokio::time::timeout(DIRECT_TIMEOUT, tokio_tungstenite::connect_async(request.clone())).await {
-        Ok(Ok((ws, resp))) => {
-            eprintln!("[binance-ws] connected DIRECT");
-            return Ok((ws, resp));
-        }
+        Ok(Ok((ws, resp))) => return Ok((ws, resp)),
         Ok(Err(e)) => {
             eprintln!("[binance-ws] direct connect failed: {e}, falling back to proxy");
         }
@@ -193,13 +188,12 @@ async fn connect_with_proxy(
     let Some(proxy_url) = proxy_url else {
         return Err("direct connect failed and no proxy configured".into());
     };
-    eprintln!("[binance-ws] using proxy {proxy_url}");
 
     // HTTP 代理：先 CONNECT 隧道，再 TLS，再 WebSocket
     let proxy_uri = proxy_url
         .trim_start_matches("http://")
         .trim_start_matches("https://");
-    let proxy_addr = if let Some(idx) = proxy_uri.rfind(':') {
+    let proxy_addr = if proxy_uri.contains(':') {
         proxy_uri.to_string()
     } else {
         format!("{proxy_uri}:7890")
@@ -248,7 +242,6 @@ async fn connect_with_proxy(
     }
 
     // 4. 在已建立隧道上跑 TLS + WebSocket
-    eprintln!("[binance-ws] tunnel established, starting TLS+WS");
     let (ws, resp) = client_async_tls_with_config(request, tcp, None, None).await?;
     Ok((ws, resp))
 }

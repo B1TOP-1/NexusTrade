@@ -22,6 +22,7 @@ hex = "0.4"
 rust_decimal = { workspace = true }
 async-trait = { workspace = true }
 chrono = "0.4"
+binance-futures-rs = "0.1.2"
 
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }
@@ -30,3 +31,11 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "net", "
 [[example]]
 name = "live_book"
 path = "examples/live_book.rs"
+
+[[example]]
+name = "live_exec"
+path = "examples/live_exec.rs"
+
+[[example]]
+name = "bench_exec"
+path = "examples/bench_exec.rs"

@@ -182,7 +182,8 @@ impl MarketVenue for BinanceMarket {
                         } else {
                             nexus_core::Side::Buy
                         },
-                        venue_ts_ms: trade.event_time as i64,
+                        // 成交流权威时间戳用 T（撮合时间，local-T），不用 E（网关时间）。
+                        venue_ts_ms: trade.trade_time as i64,
                         local_recv_ms: nexus_core::now_ms(),
                     };
                     if tx.send(pt).await.is_err() {

@@ -318,10 +318,12 @@ impl PrivateVenue for BinanceVenue {
             .await
             .map_err(|e| NexusError::Transport(format!("account: {e}")))?;
 
-        let account: AccountInfo = resp
+        // Binance 字段频繁漂移 → 宽容解析（缺失字段回退默认值），不做严格反序列化。
+        let raw: serde_json::Value = resp
             .json()
             .await
             .map_err(|e| NexusError::Transport(format!("account parse: {e}")))?;
+        let account = AccountInfo::from_raw(&raw);
 
         let positions = account
             .positions

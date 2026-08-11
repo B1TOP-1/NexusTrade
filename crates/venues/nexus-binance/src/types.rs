@@ -80,8 +80,12 @@ pub struct SubscribeResponse {
 pub struct AggTradeData {
     #[serde(rename = "e")]
     pub event_type: String,
+    /// E = 网关吐出时间（local-E），盘口流/成交流的网关时间戳。
     #[serde(rename = "E")]
     pub event_time: u64,
+    /// T = 撮合时间（local-T），成交流的权威时间戳。
+    #[serde(rename = "T")]
+    pub trade_time: u64,
     #[serde(rename = "s")]
     pub symbol: String,
     #[serde(rename = "p")]
@@ -248,33 +252,71 @@ pub struct WsCancelParams {
 }
 
 // ── REST account snapshot ──
+//
+// Binance `/fapi/v2/account` 响应字段频繁增减。为免疫字段漂移，
+// 这里用 serde_json::Value 手动提取所需字段，缺失即默认值，绝不硬反序列化。
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct AccountInfo {
     pub positions: Vec<AccountPosition>,
     pub assets: Vec<AccountAsset>,
-    #[serde(default)]
     pub canDeposit: bool,
-    #[serde(default)]
     pub canTrade: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct AccountPosition {
     pub symbol: String,
-    #[serde(default)]
     pub positionAmt: String,
-    #[serde(default)]
     pub entryPrice: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct AccountAsset {
     pub asset: String,
-    #[serde(default)]
     pub walletBalance: String,
-    #[serde(default)]
     pub availableBalance: String,
+}
+
+impl AccountInfo {
+    /// 从 `/fapi/v2/account` 原始 JSON 宽容解析。任何字段缺失都回退默认值。
+    pub fn from_raw(value: &serde_json::Value) -> Self {
+        let positions = value["positions"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|p| AccountPosition {
+                        symbol: p["symbol"].as_str().unwrap_or("").to_string(),
+                        positionAmt: p["positionAmt"].as_str().unwrap_or("0").to_string(),
+                        entryPrice: p["entryPrice"].as_str().unwrap_or("0").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let assets = value["assets"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|a| AccountAsset {
+                        asset: a["asset"].as_str().unwrap_or("").to_string(),
+                        walletBalance: a["walletBalance"].as_str().unwrap_or("0").to_string(),
+                        availableBalance: a["availableBalance"]
+                            .as_str()
+                            .unwrap_or("0")
+                            .to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Self {
+            positions,
+            assets,
+            canDeposit: value["canDeposit"].as_bool().unwrap_or(false),
+            canTrade: value["canTrade"].as_bool().unwrap_or(false),
+        }
+    }
 }
 
 // ── depth response wrapper (for combined stream) ──

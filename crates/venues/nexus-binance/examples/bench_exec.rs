@@ -199,22 +199,52 @@ async fn bench_library(
     report("库撤单", &cancel_samples);
 }
 
-// ── 账户查询对比 ──
+// ── 账户查询对比（只统计成功请求，失败不计入）──
 
-async fn bench_account(venue: &BinanceVenue, client: &BinanceClient) {
+async fn bench_account(venue: &BinanceVenue, client: &BinanceClient, rounds: usize) {
     let mut self_samples = Vec::new();
     let mut lib_samples = Vec::new();
+    let mut self_fail = 0usize;
+    let mut lib_fail = 0usize;
 
-    for _ in 0..3 {
+    for i in 0..rounds {
         let t0 = std::time::Instant::now();
-        let _ = client.account().balance().await;
-        lib_samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        match client.account().balance().await {
+            Ok(b) => {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                lib_samples.push(ms);
+                println!("    [库] 账户查询#{i} {ms:.1}ms 成功 {} 条", b.len());
+            }
+            Err(e) => {
+                lib_fail += 1;
+                println!("    [库] 账户查询#{i} FAILED: {e}");
+            }
+        }
 
         let t1 = std::time::Instant::now();
-        let _ = venue.snapshot().await;
-        self_samples.push(t1.elapsed().as_secs_f64() * 1000.0);
+        match venue.snapshot().await {
+            Ok(s) => {
+                let ms = t1.elapsed().as_secs_f64() * 1000.0;
+                self_samples.push(ms);
+                println!(
+                    "    [自研] 账户查询#{i} {ms:.1}ms 成功 持仓={} 余额={}",
+                    s.positions.len(),
+                    s.balances.len()
+                );
+            }
+            Err(e) => {
+                self_fail += 1;
+                println!("    [自研] 账户查询#{i} FAILED: {e}");
+            }
+        }
     }
 
+    println!(
+        "  （自研成功 {}/{} 失败 {self_fail}；库成功 {}/{rounds} 失败 {lib_fail}）",
+        self_samples.len(),
+        rounds,
+        lib_samples.len()
+    );
     report("自研账户查询", &self_samples);
     report("库账户查询", &lib_samples);
 }
@@ -303,8 +333,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if let Some(venue) = &venue {
-        println!("\n────────── 1. 账户查询延迟 (3 轮) ──────────");
-        bench_account(venue, &client).await;
+        println!("\n────────── 1. 账户查询延迟 ({rounds} 轮, 只统计成功) ──────────");
+        bench_account(venue, &client, rounds).await;
 
         println!("\n────────── 2. 下单 + 撤单延迟 ──────────");
         println!("  [自研 execution.rs]");

@@ -39,3 +39,7 @@ path = "examples/live_exec.rs"
 [[example]]
 name = "bench_exec"
 path = "examples/bench_exec.rs"
+
+[[example]]
+name = "ws_place"
+path = "examples/ws_place.rs"

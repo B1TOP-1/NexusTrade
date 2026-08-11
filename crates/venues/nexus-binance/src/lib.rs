@@ -13,8 +13,10 @@ pub mod execution;
 pub mod market;
 pub mod types;
 pub mod ws;
+pub mod ws_exec;
 
 pub use execution::{BinanceVenue, BinanceVenueConfig};
 pub use market::{BinanceMarket, BinanceMarketConfig};
+pub use ws_exec::WsFapiClient;
 
 pub use types::DepthStreamData;

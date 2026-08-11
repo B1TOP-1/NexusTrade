@@ -118,6 +118,7 @@ async fn connect_user_stream(
         .await
         .map_err(|e| e.to_string())?;
     let lk = resp["listenKey"].as_str().ok_or("listenKey missing")?.to_string();
+    eprintln!("[user-stream] listenKey: {}... (长度 {})", &lk[..12.min(lk.len())], lk.len());
     let url = if rest_url.contains("testnet") {
         format!("wss://stream.binancefuture.com/private/ws/{lk}")
     } else {
@@ -255,8 +256,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. 逐轮测试（交替开/平仓）
     println!("\n[4] 开始 taker 市价测试（开/平交替）...\n");
-    // 首轮下单前等用户流连接稳定（listenKey 推送就绪，避免第一笔 OTU 丢失）
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // 首轮下单前等用户流后台 task 完全启动（listenKey 推送就绪）
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     println!("  用户流稳定等待完成，开始下单...");
     let mut book_local_e: Vec<f64> = Vec::new();
     let mut book_local_t: Vec<f64> = Vec::new();

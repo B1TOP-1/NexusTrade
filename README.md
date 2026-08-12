@@ -87,3 +87,4 @@ python3 test_local_order_book.py BTCUSDT
 - [`docs/architecture.md`](docs/architecture.md)：唯一真理源（架构/状态机/接入规范）
 - [`docs/binance_local_order_book.md`](docs/binance_local_order_book.md)：行情 URL/端点/本地簿算法/用户流陷阱/实测数据
 - [`docs/binance_order_spec.md`](docs/binance_order_spec.md)：挂单/市价/状态机/用户流事件完整规范（供 AI 实现参考）
+- [`docs/gate_integration.md`](docs/gate_integration.md)：Gate 接入文档（端点/下单/行情/私有流，**待实盘验证**）

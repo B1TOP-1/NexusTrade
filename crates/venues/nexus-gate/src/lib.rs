@@ -30,5 +30,6 @@ pub mod execution_client;
 pub mod factories;
 pub mod http;
 pub mod instrument;
+pub mod nexus_exec;
 pub mod sbe;
 pub mod websocket;

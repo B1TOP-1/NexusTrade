@@ -4564,6 +4564,7 @@ dependencies = [
  "nautilus-network",
  "nautilus-testkit",
  "nautilus-trading",
+ "nexus-core",
  "rstest 0.18.2",
  "rust_decimal",
  "serde",

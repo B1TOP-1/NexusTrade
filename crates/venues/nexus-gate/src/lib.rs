@@ -32,5 +32,6 @@ pub mod http;
 pub mod instrument;
 pub mod nexus_exec;
 pub mod nexus_market;
+pub mod nexus_private;
 pub mod sbe;
 pub mod websocket;

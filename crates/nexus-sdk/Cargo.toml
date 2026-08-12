@@ -10,6 +10,7 @@ default = ["hype", "lighter"]
 hype = ["dep:nexus-hype"]
 lighter = ["dep:nexus-lighter"]
 binance = ["dep:nexus-binance"]
+gate = ["dep:nexus-gate"]
 
 [dependencies]
 nexus-core = { path = "../nexus-core" }
@@ -19,6 +20,7 @@ nexus-risk = { path = "../nexus-risk" }
 nexus-hype = { path = "../venues/nexus-hype", optional = true }
 nexus-lighter = { path = "../venues/nexus-lighter", optional = true }
 nexus-binance = { path = "../venues/nexus-binance", optional = true }
+nexus-gate = { path = "../venues/nexus-gate", optional = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
@@ -28,3 +30,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "
 [[example]]
 name = "dual_edge"
 required-features = ["hype", "lighter"]
+
+[[example]]
+name = "gate_smoke"
+required-features = ["gate"]

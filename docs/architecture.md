@@ -79,7 +79,7 @@ NexusTrade/
 │       ├── nexus-binance/        # 已实现：行情(depth@0ms/100ms) + WS下单(ws-fapi) + REST + 用户流 + OrderManager
 │       ├── nexus-okx/            # 规划
 │       ├── nexus-bybit/          # 规划
-│       ├── nexus-gate/           # 规划
+│       ├── nexus-gate/           # 已实现：WS下单 + 20ms本地簿 + 私有流(从鹦鹉螺剥离)
 │       └── nexus-bitget/         # 规划
 ```
 
@@ -311,7 +311,8 @@ Kill switch 是 SDK 内唯一允许"未经策略同意就动订单"的模块。
 | **M2** | ✅ | `nexus-net`（限流/仪表）+ `nexus-book`（统一新鲜度口径/双轨）+ `nexus-risk`（watchdog/kill switch） | 26+14+7 项全绿 |
 | **M3** | ✅ | `nexus-sdk` 门面 + 示例策略（双所 Edge 打印 demo）+ binance feature flag | SDK 示例编译通过 |
 | **M4** | ✅ | `nexus-binance`（行情 depth@0ms/100ms + WS 下单 ws-fapi(HMAC) + REST + listenKey 用户流 + OrderManager），本地订单簿按 Binance 官方算法（先 WS 缓存→REST 快照对齐→U/u/pu 连续性校验→绝对量覆盖） | 实测：WS 下单挂单确认 3.42ms、local-E/T 1-3us、滑点 0%、用户流全事件分类处理 |
-| **M5+** | ⬜ | OKX → Bybit → Gate → Bitget，每所一个原子迭代 | 同 §9 清单 |
+| **M5** | 🚧 | Gate（从鹦鹉螺剥离：WS下单 + 20ms本地簿 + 私有流，三大 trait 已接入） | 待实盘验证 |
+| **M6+** | ⬜ | OKX → Bybit → Bitget，每所一个原子迭代 | 同 §9 清单 |
 
 当前全量：**274 项测试全绿**。
 
@@ -330,3 +331,4 @@ Kill switch 是 SDK 内唯一允许"未经策略同意就动订单"的模块。
 | A5 | 不采纳 EC2 hunting/网络分离进 SDK（归运维文档） | 待确认 | — |
 | A6 | M4 Binance 下单：实测 ws-fapi 支持 HMAC-SHA256（无需 Ed25519），已实现 WS 下单 | B1TOP | 2026-08-03 |
 | A7 | Binance `depth@0ms` 实测可用（非固定 0ms，尽可能实时），接入本地订单簿 | B1TOP | 2026-08-11 |
+| A8 | Gate 从鹦鹉螺剥离（nautilus-gate crate），execution/market/private 解耦为 nexus-core trait | B1TOP | 2026-08-12 |

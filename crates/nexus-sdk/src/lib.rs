@@ -27,3 +27,8 @@ pub use nexus_lighter::{LighterMarket, LighterMarketConfig, LighterVenue, Lighte
 
 #[cfg(feature = "binance")]
 pub use nexus_binance::{BinanceMarket, BinanceMarketConfig, BinanceVenue, BinanceVenueConfig};
+
+#[cfg(feature = "gate")]
+pub use nexus_gate::{
+    GateExecConfig, GateMarket, GateMarketConfig, GatePrivate, GatePrivateConfig, GateVenue,
+};

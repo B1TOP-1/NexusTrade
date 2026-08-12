@@ -4632,6 +4632,7 @@ dependencies = [
  "nexus-binance",
  "nexus-book",
  "nexus-core",
+ "nexus-gate",
  "nexus-hype",
  "nexus-lighter",
  "nexus-net",

@@ -35,3 +35,7 @@ pub mod nexus_market;
 pub mod nexus_private;
 pub mod sbe;
 pub mod websocket;
+
+pub use nexus_exec::{GateExecConfig, GateVenue};
+pub use nexus_market::{GateMarket, GateMarketConfig};
+pub use nexus_private::{GatePrivate, GatePrivateConfig};

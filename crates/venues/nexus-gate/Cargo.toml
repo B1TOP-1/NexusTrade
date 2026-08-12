@@ -1,0 +1,44 @@
+[package]
+name = "nexus-gate"
+readme = "README.md"
+version = "0.1.0"
+edition = "2024"
+description = "Gate exchange data adapter (from Nautilus, phase-1 independent)"
+license = "MIT"
+
+[lib]
+name = "nexus_gate"
+crate-type = ["rlib"]
+
+[features]
+default = ["high-precision"]
+high-precision = ["nautilus-model/high-precision"]
+
+[dependencies]
+nautilus-common = { version = "0.58.0", features = ["live"] }
+nautilus-core = { version = "0.58.0" }
+nautilus-live = { version = "0.58.0", default-features = false }
+nautilus-model = { version = "0.58.0" }
+nautilus-network = { version = "0.58.0" }
+
+ahash = "0.8"
+anyhow = "1"
+async-stream = "0.3"
+async-trait = "0.1"
+aws-lc-rs = "1"
+bon = "2"
+futures-util = "0.3"
+log = "0.4"
+rust_decimal = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
+tokio-util = "0.7"
+ustr = "1"
+
+[dev-dependencies]
+nautilus-live = { version = "0.58.0", features = ["node"] }
+nautilus-testkit = { version = "0.58.0" }
+nautilus-trading = { version = "0.58.0" }
+rstest = "0.18"

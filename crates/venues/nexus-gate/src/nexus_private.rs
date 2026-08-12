@@ -99,7 +99,7 @@ impl PrivateVenue for GatePrivate {
     async fn subscribe(&self) -> Result<AccountStream> {
         let (tx, rx) = mpsc::channel(4096);
         let config = self.config.clone();
-        let mut write_tx = tx;
+        let write_tx = tx;
 
         tokio::spawn(async move {
             loop {

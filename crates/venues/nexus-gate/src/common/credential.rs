@@ -21,7 +21,7 @@
 //! `hex(HMAC_SHA512(secret, "channel={c}&event={e}&time={t}"))`.
 
 use aws_lc_rs::{digest, hmac};
-use nautilus_model::enums::OrderSide;
+use nexus_core::Side;
 
 /// Gate APIv4 path prefix included in the REST signature string.
 pub const GATE_API_PREFIX: &str = "/api/v4";
@@ -107,16 +107,15 @@ impl GateCredential {
 /// # Errors
 ///
 /// Returns an error if `size` is zero or the side is not buy/sell.
-pub fn signed_size(side: OrderSide, size: u64) -> anyhow::Result<i64> {
+pub fn signed_size(side: Side, size: u64) -> anyhow::Result<i64> {
     if size == 0 {
         anyhow::bail!("Gate futures size must be a positive contract count");
     }
     let magnitude = i64::try_from(size)
         .map_err(|_| anyhow::anyhow!("Gate futures size {size} exceeds i64"))?;
     match side {
-        OrderSide::Buy => Ok(magnitude),
-        OrderSide::Sell => Ok(-magnitude),
-        other => anyhow::bail!("Unsupported Gate order side: {other:?}"),
+        Side::Buy => Ok(magnitude),
+        Side::Sell => Ok(-magnitude),
     }
 }
 
@@ -233,9 +232,9 @@ mod tests {
 
     #[test]
     fn signed_size_direction() {
-        assert_eq!(signed_size(OrderSide::Buy, 3).unwrap(), 3);
-        assert_eq!(signed_size(OrderSide::Sell, 3).unwrap(), -3);
-        assert!(signed_size(OrderSide::Buy, 0).is_err());
+        assert_eq!(signed_size(Side::Buy, 3).unwrap(), 3);
+        assert_eq!(signed_size(Side::Sell, 3).unwrap(), -3);
+        assert!(signed_size(Side::Buy, 0).is_err());
     }
 
     #[test]

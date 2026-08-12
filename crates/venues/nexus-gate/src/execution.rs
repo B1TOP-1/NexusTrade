@@ -23,7 +23,7 @@
 //! is used directly as Gate `size`. Strategies converting from a base amount use
 //! [`base_qty_to_contracts`].
 
-use nautilus_model::enums::{OrderSide, TimeInForce};
+use nexus_core::{Side, Tif};
 
 use crate::common::credential::{normalize_order_text, signed_size};
 
@@ -32,14 +32,14 @@ use crate::common::credential::{normalize_order_text, signed_size};
 /// # Errors
 ///
 /// Returns an error if the time-in-force is not supported by Gate futures.
-pub fn map_gate_tif(time_in_force: TimeInForce, post_only: bool) -> anyhow::Result<&'static str> {
+pub fn map_gate_tif(tif: Tif, post_only: bool) -> anyhow::Result<&'static str> {
     if post_only {
         return Ok("poc"); // pending-or-cancelled (post-only)
     }
-    match time_in_force {
-        TimeInForce::Gtc | TimeInForce::Gtd => Ok("gtc"),
-        TimeInForce::Ioc => Ok("ioc"),
-        TimeInForce::Fok => Ok("fok"),
+    match tif {
+        Tif::Gtc => Ok("gtc"),
+        Tif::Ioc => Ok("ioc"),
+        Tif::Fok => Ok("fok"),
         other => anyhow::bail!("Unsupported Gate time in force: {other:?}"),
     }
 }
@@ -79,7 +79,7 @@ pub fn base_qty_to_contracts(
 /// Returns an error if the size or side is invalid for Gate.
 pub fn build_order_req_param(
     contract: &str,
-    side: OrderSide,
+    side: Side,
     size_contracts: u64,
     price: Option<&str>,
     tif: &str,
@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn limit_buy_req_param() {
         let v =
-            build_order_req_param("BTC_USDT", OrderSide::Buy, 2, Some("61000"), "gtc", false, "abc")
+            build_order_req_param("BTC_USDT", Side::Buy, 2, Some("61000"), "gtc", false, "abc")
                 .unwrap();
         assert_eq!(v["contract"], "BTC_USDT");
         assert_eq!(v["size"], 2);
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn market_sell_req_param() {
         let v =
-            build_order_req_param("ETH_USDT", OrderSide::Sell, 5, None, "ioc", true, "t-x").unwrap();
+            build_order_req_param("ETH_USDT", Side::Sell, 5, None, "ioc", true, "t-x").unwrap();
         assert_eq!(v["size"], -5); // sell -> negative
         assert_eq!(v["price"], "0"); // market
         assert_eq!(v["tif"], "ioc");
@@ -304,10 +304,10 @@ mod tests {
 
     #[test]
     fn tif_mapping() {
-        assert_eq!(map_gate_tif(TimeInForce::Gtc, false).unwrap(), "gtc");
-        assert_eq!(map_gate_tif(TimeInForce::Gtc, true).unwrap(), "poc");
-        assert_eq!(map_gate_tif(TimeInForce::Ioc, false).unwrap(), "ioc");
-        assert_eq!(map_gate_tif(TimeInForce::Fok, false).unwrap(), "fok");
+        assert_eq!(map_gate_tif(Tif::Gtc, false).unwrap(), "gtc");
+        assert_eq!(map_gate_tif(Tif::Gtc, true).unwrap(), "poc");
+        assert_eq!(map_gate_tif(Tif::Ioc, false).unwrap(), "ioc");
+        assert_eq!(map_gate_tif(Tif::Fok, false).unwrap(), "fok");
     }
 
     #[test]
@@ -355,4 +355,40 @@ mod tests {
         assert_eq!(orders[0].text.as_deref(), Some("t-abc"));
         assert_eq!(orders[0].finish_as.as_deref(), Some("cancelled"));
     }
+}
+
+/// Builds a Gate WS-API request envelope (`event:"api"`).
+#[must_use]
+pub fn build_api_envelope(
+    channel: &str,
+    req_id: &str,
+    req_param: &serde_json::Value,
+    timestamp: i64,
+) -> String {
+    serde_json::json!({
+        "time": timestamp,
+        "channel": channel,
+        "event": "api",
+        "payload": {"req_id": req_id, "req_param": req_param},
+    })
+    .to_string()
+}
+
+/// Builds a private channel subscribe envelope with `api_key` auth.
+#[must_use]
+pub fn build_subscribe_private_envelope(
+    channel: &str,
+    payload: &[String],
+    api_key: &str,
+    signature: &str,
+    timestamp: i64,
+) -> String {
+    serde_json::json!({
+        "time": timestamp,
+        "channel": channel,
+        "event": "subscribe",
+        "payload": payload,
+        "auth": {"method": "api_key", "KEY": api_key, "SIGN": signature},
+    })
+    .to_string()
 }

@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use nexus_core::{
-    ExecutionVenue, NewOrder, NexusError, OrderAck, OrderKind, OrderRef, Result, Side, Symbol,
+    ExecutionVenue, NewOrder, NexusError, OrderAck, OrderKind, OrderRef, Result, Symbol,
     Tif, VenueCapabilities, VenueId,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::execution::build_order_req_param;
-use crate::websocket::client::build_api_envelope;
+use crate::execution::build_api_envelope;
 
 /// Gate 交易配置。
 #[derive(Debug, Clone)]
@@ -119,14 +119,9 @@ impl ExecutionVenue for GateVenue {
         let client_order_id = order.client_id.0.clone();
         let text = crate::common::credential::normalize_order_text(&client_order_id);
 
-        // nexus Side → nautilus OrderSide（build_order_req_param 需要）
-        let gate_side = match order.side {
-            Side::Buy => nautilus_model::enums::OrderSide::Buy,
-            Side::Sell => nautilus_model::enums::OrderSide::Sell,
-        };
         let req_param = build_order_req_param(
             &contract,
-            gate_side,
+            order.side,
             size,
             price.as_deref(),
             tif,

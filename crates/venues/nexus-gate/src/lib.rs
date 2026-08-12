@@ -23,13 +23,8 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod common;
-pub mod config;
-pub mod data;
 pub mod execution;
-pub mod execution_client;
-pub mod factories;
 pub mod http;
-pub mod instrument;
 pub mod nexus_exec;
 pub mod nexus_market;
 pub mod nexus_private;

@@ -1,5 +1,3 @@
-use nautilus_model::identifiers::Venue;
-use ustr::Ustr;
 
 pub const GATE: &str = "GATE";
 pub const GATE_WS_CHANNEL_FUTURES_OBU: &str = "futures.obu";
@@ -14,5 +12,4 @@ pub const GATE_WS_PUBLIC_URL: &str = "wss://fx-ws.gateio.ws/v4/ws/usdt";
 /// silently vanish from pushes. Required on the private/execution connection.
 pub const GATE_WS_SIZE_DECIMAL_HEADER: (&str, &str) = ("X-Gate-Size-Decimal", "1");
 
-pub static GATE_VENUE: std::sync::LazyLock<Venue> =
-    std::sync::LazyLock::new(|| Venue::new(Ustr::from(GATE)));
+pub static GATE_VENUE: &str = GATE;

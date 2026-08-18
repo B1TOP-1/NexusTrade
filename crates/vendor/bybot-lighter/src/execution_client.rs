@@ -157,9 +157,13 @@ pub struct LighterSubmitReceipt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LighterSubmitTiming {
     pub submit_started_at_ms: u64,
+    /// Time spent waiting for the per-API-key submission lock.
+    pub lock_wait_ms: u64,
     pub sign_ms: u64,
     pub send_ms: u64,
     pub ack_ms: u64,
+    /// End-to-end local monotonic time from the submission call to its ACK.
+    pub submit_total_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,7 +494,9 @@ impl LighterExecutionClient {
         }
         // Lighter requires one strictly sequential nonce stream per API key.
         // This lock covers signing, submission, and any failure resynchronization.
+        let submit_started = Instant::now();
         let _submission = self.inner.submission_lock.lock().await;
+        let lock_wait_ms = elapsed_millis(submit_started);
         let submit_started_at_ms = now_millis();
         let sign_started = Instant::now();
         let prepared = match self.prepare_order(request) {
@@ -541,9 +547,11 @@ impl LighterExecutionClient {
             effects,
             timing: LighterSubmitTiming {
                 submit_started_at_ms,
+                lock_wait_ms,
                 sign_ms,
                 send_ms: transport_timing.send_ms,
                 ack_ms: transport_timing.ack_ms,
+                submit_total_ms: elapsed_millis(submit_started),
             },
         })
     }
@@ -557,7 +565,9 @@ impl LighterExecutionClient {
         if !self.account_snapshot_ready() {
             bail!("Lighter account WebSocket snapshot is not ready");
         }
+        let submit_started = Instant::now();
         let _submission = self.inner.submission_lock.lock().await;
+        let lock_wait_ms = elapsed_millis(submit_started);
         // Fetch this before reserving a nonce: disabled WS entry must not
         // consume a nonce or be mistaken for an ambiguous submission.
         let submitter = self.ws_submitter().await?;
@@ -605,9 +615,11 @@ impl LighterExecutionClient {
             effects,
             timing: LighterSubmitTiming {
                 submit_started_at_ms,
+                lock_wait_ms,
                 sign_ms,
                 send_ms: receipt.timing.send_ms,
                 ack_ms: receipt.timing.ack_ms,
+                submit_total_ms: elapsed_millis(submit_started),
             },
         })
     }

@@ -1,7 +1,7 @@
 use std::{
     env,
     str::FromStr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context, Result};
@@ -10,7 +10,7 @@ use bybot_lighter::{
     execution::LighterExecutionEffect,
     execution_client::{
         LighterExecutionClient, LighterExecutionConfig, LighterOrderRequest, LighterOrderType,
-        LighterTimeInForce,
+        LighterSubmitTiming, LighterTimeInForce,
     },
     http::LighterHttpClient,
     local_book::LighterLocalBook,
@@ -35,6 +35,18 @@ struct FillResult {
     average_price: Decimal,
     fee: Decimal,
     position: Decimal,
+    first_fill_ms: u64,
+    position_confirm_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PublicBbo {
+    bid: Decimal,
+    ask: Decimal,
+    connect_ms: u64,
+    subscribe_ms: u64,
+    first_book_ms: u64,
+    total_ms: u64,
 }
 
 #[tokio::main]
@@ -47,17 +59,26 @@ async fn run() -> Result<()> {
     let quantity = Decimal::from_str(QUANTITY_TEXT)?;
     let http_url = optional_env("LIGHTER_HTTP_URL", DEFAULT_HTTP_URL);
     let public_ws_url = optional_env("LIGHTER_PUBLIC_WS_URL", DEFAULT_PUBLIC_WS_URL);
+    let market_started = Instant::now();
     let market = load_btc_market(&http_url).await?;
+    println!("STEP latency_market_specs total_ms={}", elapsed_millis(market_started));
     if quantity < market.min_base_amount {
         bail!(
             "BTC smoke quantity {quantity} is below Lighter minimum {}",
             market.min_base_amount
         );
     }
-    let (bid, ask) = public_bbo(&public_ws_url, market.market_id).await?;
+    let open_bbo = public_bbo(&public_ws_url, market.market_id).await?;
     println!(
-        "STEP public_ws_ok symbol={SYMBOL} market_id={} bid={bid} ask={ask}",
-        market.market_id
+        "STEP public_ws_ok symbol={SYMBOL} market_id={} bid={} ask={}",
+        market.market_id, open_bbo.bid, open_bbo.ask
+    );
+    println!(
+        "STEP latency_public_bbo connect_ms={} subscribe_ms={} first_book_ms={} total_ms={}",
+        open_bbo.connect_ms,
+        open_bbo.subscribe_ms,
+        open_bbo.first_book_ms,
+        open_bbo.total_ms,
     );
     if env::args().any(|argument| argument == "--public-only") {
         println!("PASS lighter_live_smoke public_price=true private_fill=skipped position_ws=skipped auto_closed=skipped");
@@ -83,16 +104,34 @@ async fn run() -> Result<()> {
         api_key_index,
         chain_id,
     )?;
+    let execution_connect_started = Instant::now();
     let client = LighterExecutionClient::connect(config, &private_key).await?;
+    println!(
+        "STEP latency_execution_connect total_ms={}",
+        elapsed_millis(execution_connect_started)
+    );
+    let private_runtime_started = Instant::now();
     let runtime = client.spawn_private_runtime().await?;
+    let private_runtime_start_ms = elapsed_millis(private_runtime_started);
     let mut effects = runtime.subscribe();
+    let snapshot_started = Instant::now();
     client.wait_account_snapshot().await?;
+    println!(
+        "STEP latency_private_snapshot runtime_start_ms={} snapshot_ready_ms={}",
+        private_runtime_start_ms,
+        elapsed_millis(snapshot_started)
+    );
     if use_ws_submission {
+        let ws_entry_started = Instant::now();
         client
             .enable_ws_submission()
             .await
             .context("connect Lighter WS order-entry socket")?;
         println!("STEP ws_order_entry_connected=true");
+        println!(
+            "STEP latency_ws_order_entry connected_ms={}",
+            elapsed_millis(ws_entry_started)
+        );
     }
     let initial_position = btc_position(&client).await?;
     println!("STEP private_ws_ok initial_btc_position={initial_position}");
@@ -105,13 +144,14 @@ async fn run() -> Result<()> {
     let open_index = next_client_order_index()?;
     let open_id = format!("lighter-smoke-open-{open_index}");
     client.restore_order_tracking(&open_id, open_index)?;
+    let open_order_started = Instant::now();
     let open_receipt = submit_order(
         &client,
         market_order(
             &open_id,
             open_index,
             quantity,
-            ask * Decimal::new(101, 2),
+            open_bbo.ask * Decimal::new(101, 2),
             false,
         ),
         use_ws_submission,
@@ -121,25 +161,40 @@ async fn run() -> Result<()> {
         "STEP open_submitted client_order_index={open_index} tx_hash={}",
         open_receipt.ack.tx_hash
     );
+    println!("{}", format_submit_timing("open", open_receipt.timing));
     let open_fill =
         wait_for_fill_and_position(&client, &mut effects, open_index, quantity, quantity).await?;
     println!(
         "STEP open_filled quantity={} average_price={} fee={} ws_position={}",
         open_fill.quantity, open_fill.average_price, open_fill.fee, open_fill.position
     );
+    println!(
+        "STEP latency_private_lifecycle order=open ack_to_first_fill_ms={} ack_to_position_confirm_ms={} order_e2e_ms={}",
+        open_fill.first_fill_ms,
+        open_fill.position_confirm_ms,
+        elapsed_millis(open_order_started)
+    );
 
-    let (close_bid, close_ask) = public_bbo(&public_ws_url, market.market_id).await?;
-    println!("STEP close_public_ws_ok bid={close_bid} ask={close_ask}");
+    let close_bbo = public_bbo(&public_ws_url, market.market_id).await?;
+    println!("STEP close_public_ws_ok bid={} ask={}", close_bbo.bid, close_bbo.ask);
+    println!(
+        "STEP latency_close_public_bbo connect_ms={} subscribe_ms={} first_book_ms={} total_ms={}",
+        close_bbo.connect_ms,
+        close_bbo.subscribe_ms,
+        close_bbo.first_book_ms,
+        close_bbo.total_ms,
+    );
     let close_index = ((open_index + 1) & CLIENT_ORDER_INDEX_MAX).max(1);
     let close_id = format!("lighter-smoke-close-{close_index}");
     client.restore_order_tracking(&close_id, close_index)?;
+    let close_order_started = Instant::now();
     let close_receipt = submit_order(
         &client,
         market_order(
             &close_id,
             close_index,
             -open_fill.quantity,
-            close_bid * Decimal::new(99, 2),
+            close_bbo.bid * Decimal::new(99, 2),
             true,
         ),
         use_ws_submission,
@@ -149,6 +204,7 @@ async fn run() -> Result<()> {
         "STEP close_submitted client_order_index={close_index} tx_hash={}",
         close_receipt.ack.tx_hash
     );
+    println!("{}", format_submit_timing("close", close_receipt.timing));
     let close_fill = wait_for_fill_and_position(
         &client,
         &mut effects,
@@ -160,6 +216,12 @@ async fn run() -> Result<()> {
     println!(
         "STEP close_filled quantity={} average_price={} fee={} ws_position={}",
         close_fill.quantity, close_fill.average_price, close_fill.fee, close_fill.position
+    );
+    println!(
+        "STEP latency_private_lifecycle order=close ack_to_first_fill_ms={} ack_to_position_confirm_ms={} order_e2e_ms={}",
+        close_fill.first_fill_ms,
+        close_fill.position_confirm_ms,
+        elapsed_millis(close_order_started)
     );
     println!(
         "PASS lighter_live_smoke transport={} public_price=true private_fill=true position_ws=true auto_closed=true",
@@ -209,13 +271,16 @@ async fn load_btc_market(http_url: &str) -> Result<LighterMarketSpec> {
         .context("Lighter BTC market is unavailable")
 }
 
-async fn public_bbo(ws_url: &str, market_id: u64) -> Result<(Decimal, Decimal)> {
+async fn public_bbo(ws_url: &str, market_id: u64) -> Result<PublicBbo> {
     tokio::time::timeout(EVENT_TIMEOUT, async move {
+        let started = Instant::now();
         let websocket = LighterWebSocketClient::new(LighterWebSocketConfig::new(ws_url)?);
         let mut connection = websocket.connect().await?;
+        let connect_ms = elapsed_millis(started);
         connection
             .subscribe_public(&format!("order_book/{market_id}"))
             .await?;
+        let subscribe_ms = elapsed_millis(started);
         let mut book = LighterLocalBook::new();
         loop {
             match connection.next_event().await? {
@@ -228,7 +293,15 @@ async fn public_bbo(ws_url: &str, market_id: u64) -> Result<(Decimal, Decimal)> 
                         bail!("Lighter BTC order book has a nonce gap");
                     }
                     if let Some(top) = book.top_of_book() {
-                        return Ok((top.bid_price, top.ask_price));
+                        let first_book_ms = elapsed_millis(started);
+                        return Ok(PublicBbo {
+                            bid: top.bid_price,
+                            ask: top.ask_price,
+                            connect_ms,
+                            subscribe_ms,
+                            first_book_ms,
+                            total_ms: elapsed_millis(started),
+                        });
                     }
                 }
                 LighterWsEvent::Closed => bail!("Lighter public WebSocket closed"),
@@ -267,10 +340,12 @@ async fn wait_for_fill_and_position(
     expected_position: Decimal,
 ) -> Result<FillResult> {
     tokio::time::timeout(EVENT_TIMEOUT, async {
+        let started = Instant::now();
         let mut quantity = Decimal::ZERO;
         let mut quote = Decimal::ZERO;
         let mut fee = Decimal::ZERO;
         let mut observed_fill = false;
+        let mut first_fill_ms = None;
         let mut position_interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             tokio::select! {
@@ -285,6 +360,7 @@ async fn wait_for_fill_and_position(
                                 quote += fill_quantity * fill_price;
                                 fee += Decimal::new(fill_fee, 6);
                                 observed_fill = true;
+                                first_fill_ms.get_or_insert_with(|| elapsed_millis(started));
                             }
                         LighterExecutionEffect::Rejected { client_order_index: Some(index), reason, .. }
                             if index == client_order_index => bail!("Lighter order rejected by private WebSocket: {reason}"),
@@ -301,6 +377,8 @@ async fn wait_for_fill_and_position(
                             average_price: if quantity.is_zero() { Decimal::ZERO } else { quote / quantity },
                             fee,
                             position,
+                            first_fill_ms: first_fill_ms.unwrap_or_default(),
+                            position_confirm_ms: elapsed_millis(started),
                         });
                     }
                 }
@@ -336,4 +414,43 @@ fn required_env(name: &str) -> Result<String> {
 
 fn optional_env(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn format_submit_timing(order: &str, timing: LighterSubmitTiming) -> String {
+    format!(
+        "STEP latency_submit order={order} lock_wait_ms={} sign_ms={} send_ms={} ack_ms={} submit_total_ms={}",
+        timing.lock_wait_ms,
+        timing.sign_ms,
+        timing.send_ms,
+        timing.ack_ms,
+        timing.submit_total_ms,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use bybot_lighter::execution_client::LighterSubmitTiming;
+
+    use super::format_submit_timing;
+
+    #[test]
+    fn formats_complete_submit_latency_breakdown() {
+        let timing = LighterSubmitTiming {
+            submit_started_at_ms: 1_700_000_000_000,
+            lock_wait_ms: 2,
+            sign_ms: 3,
+            send_ms: 5,
+            ack_ms: 7,
+            submit_total_ms: 11,
+        };
+
+        assert_eq!(
+            format_submit_timing("open", timing),
+            "STEP latency_submit order=open lock_wait_ms=2 sign_ms=3 send_ms=5 ack_ms=7 submit_total_ms=11"
+        );
+    }
 }

@@ -5,7 +5,10 @@ use bybot_lighter::{
         LighterTimeInForce,
     },
 };
+use futures_util::{SinkExt, StreamExt};
 use rust_decimal_macros::dec;
+use tokio::net::TcpListener;
+use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 const TEST_PRIVATE_KEY: &str =
     "0xc89d22df8df76acee9f31bd35bdc15afde6324378e760ba8d4feaa233c6292318ad4849dc4285a50";
@@ -215,6 +218,96 @@ async fn submit_is_blocked_until_account_websocket_snapshot_is_ready() {
         .contains("WebSocket snapshot is not ready"));
 }
 
+#[tokio::test]
+async fn submit_order_uses_websocket_transport_by_default() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        socket
+            .send(Message::Text(r#"{"type":"connected"}"#.into()))
+            .await
+            .unwrap();
+        let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
+        assert!(frame.contains("jsonapi/sendtx"));
+        socket
+            .send(Message::Text(
+                r#"{"type":"jsonapi/sendtx","code":200,"data":{"tx_hash":"0xws-default"}}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    });
+
+    let config = LighterExecutionConfig::new(
+        "http://127.0.0.1:1",
+        format!("ws://{address}"),
+        42,
+        1,
+        304,
+    )
+    .unwrap();
+    let client = LighterExecutionClient::new(config, TEST_PRIVATE_KEY, market_specs()).unwrap();
+    client.seed_nonce(1);
+    mark_account_snapshot_ready(&client).await;
+    client.enable_ws_submission().await.unwrap();
+
+    let receipt = client.submit_order(&order_request()).await.unwrap();
+
+    assert_eq!(receipt.ack.tx_hash, "0xws-default");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_order_uses_websocket_transport_by_default() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        socket
+            .send(Message::Text(r#"{"type":"connected"}"#.into()))
+            .await
+            .unwrap();
+        let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
+        assert!(frame.contains("jsonapi/sendtx"));
+        socket
+            .send(Message::Text(
+                r#"{"type":"jsonapi/sendtx","code":200,"data":{"tx_hash":"0xws-cancel"}}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    });
+
+    let config = LighterExecutionConfig::new(
+        "http://127.0.0.1:1",
+        format!("ws://{address}"),
+        42,
+        1,
+        304,
+    )
+    .unwrap();
+    let client = LighterExecutionClient::new(config, TEST_PRIVATE_KEY, market_specs()).unwrap();
+    client.seed_nonce(1);
+    mark_account_snapshot_ready(&client).await;
+    client.enable_ws_submission().await.unwrap();
+
+    let receipt = client
+        .cancel_order(&bybot_lighter::execution_client::LighterCancelRequest {
+            symbol: "BTC".to_string(),
+            client_order_id: "cancel-ws-default".to_string(),
+            client_order_index: Some(101),
+            order_index: 9001,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.ack.tx_hash, "0xws-cancel");
+    server.await.unwrap();
+}
+
 fn config() -> LighterExecutionConfig {
     LighterExecutionConfig::new(
         "https://mainnet.zklighter.elliot.ai",
@@ -235,6 +328,18 @@ fn market_specs() -> Vec<bybot_lighter::data::LighterMarketSpec> {
 
 fn client() -> LighterExecutionClient {
     LighterExecutionClient::new(config(), TEST_PRIVATE_KEY, market_specs()).unwrap()
+}
+
+async fn mark_account_snapshot_ready(client: &LighterExecutionClient) {
+    for payload in [
+        r#"{"type":"subscribed/account_all_orders","orders":{}}"#,
+        r#"{"type":"subscribed/account_all_trades","trades":[]}"#,
+        r#"{"type":"subscribed/account_all_positions","positions":{}}"#,
+        r#"{"type":"subscribed/user_stats","stats":{"collateral":"1000","available_balance":"750"}}"#,
+    ] {
+        client.ingest_private_ws_text(payload).unwrap();
+    }
+    client.wait_account_snapshot().await.unwrap();
 }
 
 fn order_request() -> LighterOrderRequest {

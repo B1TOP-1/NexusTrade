@@ -4,7 +4,7 @@
 //! 本层职责：类型转换、client_order_index 派生、订单状态机驱动、事件映射。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -72,8 +72,6 @@ pub struct LighterVenue {
     index_to_id: Arc<Mutex<HashMap<u64, String>>>,
     index_counter: AtomicU64,
     index_seed: u64,
-    /// HTTP remains the default until this is explicitly enabled by the caller.
-    ws_order_entry: AtomicBool,
     /// 私有流运行时：与 venue 同生命周期（Drop 即 abort 底层任务）。
     runtime: Mutex<Option<LighterExecutionRuntime>>,
 }
@@ -100,11 +98,6 @@ impl LighterVenue {
         let client = LighterExecutionClient::connect(exec_config, private_key)
             .await
             .map_err(|e| NexusError::Auth(format!("lighter connect: {e}")))?;
-        client
-            .initialize()
-            .await
-            .map_err(|e| NexusError::Transport(format!("lighter nonce init: {e}")))?;
-
         Ok(Self {
             client,
             specs,
@@ -112,7 +105,6 @@ impl LighterVenue {
             index_to_id: Arc::new(Mutex::new(HashMap::new())),
             index_counter: AtomicU64::new(0),
             index_seed: config.index_seed,
-            ws_order_entry: AtomicBool::new(false),
             runtime: Mutex::new(None),
         })
     }
@@ -144,19 +136,14 @@ impl LighterVenue {
             .map(|s| Symbol::new(s.symbol.clone(), "USDC", s.symbol.clone()))
     }
 
-    /// Enables the separately connected, single-flight WS sendTx path.
-    /// This is an explicit opt-in and does not send an order by itself.
+    /// Verifies the default, separately connected WS sendTx path is ready.
+    /// `connect()` already establishes it; this call is idempotent.
     pub async fn enable_ws_order_entry(&self) -> Result<()> {
         self.client
             .enable_ws_submission()
             .await
             .map_err(|error| NexusError::Transport(format!("lighter WS submit connect: {error}")))?;
-        self.ws_order_entry.store(true, Ordering::Release);
         Ok(())
-    }
-
-    pub fn disable_ws_order_entry(&self) {
-        self.ws_order_entry.store(false, Ordering::Release);
     }
 
     fn map_tif(order: &NewOrder) -> Result<LighterTimeInForce> {
@@ -178,7 +165,7 @@ impl ExecutionVenue for LighterVenue {
 
     fn capabilities(&self) -> VenueCapabilities {
         VenueCapabilities {
-            ws_order_entry: self.ws_order_entry.load(Ordering::Acquire),
+            ws_order_entry: true,
             batch_orders: false,
             post_only: true,
             reduce_only: true,
@@ -234,11 +221,7 @@ impl ExecutionVenue for LighterVenue {
                 .insert(client_order_index, order.client_id.0.clone());
         }
 
-        let submit_result = if self.ws_order_entry.load(Ordering::Acquire) {
-            self.client.submit_order_ws(&request).await
-        } else {
-            self.client.submit_order(&request).await
-        };
+        let submit_result = self.client.submit_order_ws(&request).await;
         match submit_result {
             Ok(_receipt) => Ok(OrderAck {
                 client_id: order.client_id,
@@ -294,11 +277,7 @@ impl ExecutionVenue for LighterVenue {
             client_order_index: Some(client_order_index),
             order_index,
         };
-        let cancel_result = if self.ws_order_entry.load(Ordering::Acquire) {
-            self.client.cancel_order_ws(&request).await
-        } else {
-            self.client.cancel_order(&request).await
-        };
+        let cancel_result = self.client.cancel_order_ws(&request).await;
         cancel_result
             .map(|_| ())
             .map_err(|e| {

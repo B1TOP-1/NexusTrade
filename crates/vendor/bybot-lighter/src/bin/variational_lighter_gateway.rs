@@ -226,7 +226,7 @@ async fn main() -> Result<()> {
                 let result = async {
                     let client = client.as_ref().context("Lighter execution is disabled")?;
                     let receipt = client
-                        .submit_order(&LighterOrderRequest {
+                        .submit_order_ws(&LighterOrderRequest {
                             symbol,
                             client_order_id,
                             client_order_index,
@@ -261,7 +261,7 @@ async fn main() -> Result<()> {
                 let result = async {
                     let client = client.as_ref().context("Lighter execution is disabled")?;
                     client
-                        .cancel_order(&LighterCancelRequest {
+                        .cancel_order_ws(&LighterCancelRequest {
                             symbol,
                             client_order_id,
                             client_order_index,

@@ -11,7 +11,7 @@
 - `websocket`：公共/私有订阅、Ping/Pong 保活、确定性订阅重放和有上限指数退避重连。
 - `data`：公共订单簿消息 DTO、对象/数组档位解析和交易所时间戳归一化。
 - `local_book`：snapshot、连续增量、重复消息幂等、nonce gap/resync、陈旧状态与 Decimal 最优价。
-- `execution_client`：市场精度缓存、nonce 初始化、原生签名、HTTP 下单/撤单、账户/持仓快照、REST 活跃订单恢复及私有 WebSocket 运行时。
+- `execution_client`：市场精度缓存、nonce 初始化、原生签名、默认 WS 下单/撤单、账户/持仓快照、REST 活跃订单恢复及私有 WebSocket 运行时。HTTP 下单/撤单只保留为显式故障降级 API。
 
 ## Bybot 接入
 

@@ -263,6 +263,7 @@ impl LighterExecutionClient {
             .await?;
         let client = Self::new(config, private_key, market_specs)?;
         client.initialize().await?;
+        client.enable_ws_submission().await?;
         Ok(client)
     }
 
@@ -340,9 +341,9 @@ impl LighterExecutionClient {
         Ok(next_nonce)
     }
 
-    /// Opens the opt-in, dedicated WebSocket `jsonapi/sendtx` connection.
-    /// HTTP remains the default submission transport until a caller uses one of
-    /// the explicit `*_ws` methods below.
+    /// Opens the dedicated WebSocket `jsonapi/sendtx` connection used by the
+    /// default submission path. It is idempotent so callers can also use it to
+    /// verify that a previously created client remains ready for WS entry.
     pub async fn enable_ws_submission(&self) -> Result<()> {
         if self.inner.ws_submitter.lock().await.is_some() {
             return Ok(());
@@ -485,7 +486,16 @@ impl LighterExecutionClient {
         })
     }
 
+    /// Default order path: the dedicated WebSocket `jsonapi/sendtx` transport.
     pub async fn submit_order(
+        &self,
+        request: &LighterOrderRequest,
+    ) -> Result<LighterSubmitReceipt> {
+        self.submit_order_ws(request).await
+    }
+
+    /// Explicit HTTP fallback. Production callers must use `submit_order`.
+    pub async fn submit_order_http(
         &self,
         request: &LighterOrderRequest,
     ) -> Result<LighterSubmitReceipt> {
@@ -556,8 +566,8 @@ impl LighterExecutionClient {
         })
     }
 
-    /// Explicit WebSocket order path. It is not used by `submit_order` and
-    /// follows the same API-key lock and nonce recovery invariants as HTTP.
+    /// WebSocket order path used by `submit_order`; it follows the same API-key
+    /// lock and nonce recovery invariants as the explicit HTTP fallback.
     pub async fn submit_order_ws(
         &self,
         request: &LighterOrderRequest,
@@ -624,7 +634,16 @@ impl LighterExecutionClient {
         })
     }
 
+    /// Default cancellation path: the dedicated WebSocket `jsonapi/sendtx` transport.
     pub async fn cancel_order(
+        &self,
+        request: &LighterCancelRequest,
+    ) -> Result<LighterCancelReceipt> {
+        self.cancel_order_ws(request).await
+    }
+
+    /// Explicit HTTP fallback. Production callers must use `cancel_order`.
+    pub async fn cancel_order_http(
         &self,
         request: &LighterCancelRequest,
     ) -> Result<LighterCancelReceipt> {

@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    let use_ws_submission = env::args().any(|argument| argument == "--ws");
+    let use_http_submission = env::args().any(|argument| argument == "--http");
     let quantity = Decimal::from_str(QUANTITY_TEXT)?;
     let http_url = optional_env("LIGHTER_HTTP_URL", DEFAULT_HTTP_URL);
     let public_ws_url = optional_env("LIGHTER_PUBLIC_WS_URL", DEFAULT_PUBLIC_WS_URL);
@@ -86,7 +86,7 @@ async fn run() -> Result<()> {
     }
 
     require_confirmation()?;
-    if use_ws_submission {
+    if !use_http_submission {
         require_ws_transport_confirmation()?;
     }
     let private_ws_url = optional_env("LIGHTER_PRIVATE_WS_URL", DEFAULT_PRIVATE_WS_URL);
@@ -121,17 +121,9 @@ async fn run() -> Result<()> {
         private_runtime_start_ms,
         elapsed_millis(snapshot_started)
     );
-    if use_ws_submission {
-        let ws_entry_started = Instant::now();
-        client
-            .enable_ws_submission()
-            .await
-            .context("connect Lighter WS order-entry socket")?;
+    if !use_http_submission {
         println!("STEP ws_order_entry_connected=true");
-        println!(
-            "STEP latency_ws_order_entry connected_ms={}",
-            elapsed_millis(ws_entry_started)
-        );
+        println!("STEP latency_ws_order_entry prewarmed=true");
     }
     let initial_position = btc_position(&client).await?;
     println!("STEP private_ws_ok initial_btc_position={initial_position}");
@@ -154,7 +146,7 @@ async fn run() -> Result<()> {
             open_bbo.ask * Decimal::new(101, 2),
             false,
         ),
-        use_ws_submission,
+        use_http_submission,
     )
     .await?;
     println!(
@@ -197,7 +189,7 @@ async fn run() -> Result<()> {
             close_bbo.bid * Decimal::new(99, 2),
             true,
         ),
-        use_ws_submission,
+        use_http_submission,
     )
     .await?;
     println!(
@@ -225,7 +217,7 @@ async fn run() -> Result<()> {
     );
     println!(
         "PASS lighter_live_smoke transport={} public_price=true private_fill=true position_ws=true auto_closed=true",
-        if use_ws_submission { "ws" } else { "http" }
+        if use_http_submission { "http" } else { "ws" }
     );
     Ok(())
 }
@@ -244,7 +236,7 @@ fn require_ws_transport_confirmation() -> Result<()> {
     let confirmation = env::var("LIGHTER_LIVE_SMOKE_TRANSPORT").unwrap_or_default();
     if confirmation != WS_TRANSPORT_CONFIRMATION {
         bail!(
-            "WS order entry blocked: set LIGHTER_LIVE_SMOKE_TRANSPORT={WS_TRANSPORT_CONFIRMATION} together with LIGHTER_LIVE_SMOKE_CONFIRM to authorize the WS smoke path"
+            "WS order entry blocked: set LIGHTER_LIVE_SMOKE_TRANSPORT={WS_TRANSPORT_CONFIRMATION} together with LIGHTER_LIVE_SMOKE_CONFIRM to authorize the default WS smoke path"
         );
     }
     Ok(())
@@ -253,10 +245,10 @@ fn require_ws_transport_confirmation() -> Result<()> {
 async fn submit_order(
     client: &LighterExecutionClient,
     request: LighterOrderRequest,
-    use_ws_submission: bool,
+    use_http_submission: bool,
 ) -> Result<bybot_lighter::execution_client::LighterSubmitReceipt> {
-    if use_ws_submission {
-        client.submit_order_ws(&request).await
+    if use_http_submission {
+        client.submit_order_http(&request).await
     } else {
         client.submit_order(&request).await
     }

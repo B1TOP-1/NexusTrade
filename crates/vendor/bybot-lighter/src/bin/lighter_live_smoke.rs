@@ -22,6 +22,7 @@ use tokio::sync::broadcast;
 const SYMBOL: &str = "BTC";
 const QUANTITY_TEXT: &str = "0.001";
 const CONFIRMATION: &str = "BUY_0.001_BTC_AND_AUTO_CLOSE";
+const WS_TRANSPORT_CONFIRMATION: &str = "WS";
 const DEFAULT_HTTP_URL: &str = "https://mainnet.zklighter.elliot.ai";
 const DEFAULT_PRIVATE_WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
 const DEFAULT_PUBLIC_WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream?readonly=true";
@@ -42,6 +43,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
+    let use_ws_submission = env::args().any(|argument| argument == "--ws");
     let quantity = Decimal::from_str(QUANTITY_TEXT)?;
     let http_url = optional_env("LIGHTER_HTTP_URL", DEFAULT_HTTP_URL);
     let public_ws_url = optional_env("LIGHTER_PUBLIC_WS_URL", DEFAULT_PUBLIC_WS_URL);
@@ -63,6 +65,9 @@ async fn run() -> Result<()> {
     }
 
     require_confirmation()?;
+    if use_ws_submission {
+        require_ws_transport_confirmation()?;
+    }
     let private_ws_url = optional_env("LIGHTER_PRIVATE_WS_URL", DEFAULT_PRIVATE_WS_URL);
     let account_index = required_env("LIGHTER_ACCOUNT_INDEX")?.parse::<u64>()?;
     let api_key_index = required_env("LIGHTER_API_KEY_INDEX")?.parse::<u8>()?;
@@ -82,6 +87,13 @@ async fn run() -> Result<()> {
     let runtime = client.spawn_private_runtime().await?;
     let mut effects = runtime.subscribe();
     client.wait_account_snapshot().await?;
+    if use_ws_submission {
+        client
+            .enable_ws_submission()
+            .await
+            .context("connect Lighter WS order-entry socket")?;
+        println!("STEP ws_order_entry_connected=true");
+    }
     let initial_position = btc_position(&client).await?;
     println!("STEP private_ws_ok initial_btc_position={initial_position}");
     if !initial_position.is_zero() {
@@ -93,15 +105,18 @@ async fn run() -> Result<()> {
     let open_index = next_client_order_index()?;
     let open_id = format!("lighter-smoke-open-{open_index}");
     client.restore_order_tracking(&open_id, open_index)?;
-    let open_receipt = client
-        .submit_order(&market_order(
+    let open_receipt = submit_order(
+        &client,
+        market_order(
             &open_id,
             open_index,
             quantity,
             ask * Decimal::new(101, 2),
             false,
-        ))
-        .await?;
+        ),
+        use_ws_submission,
+    )
+    .await?;
     println!(
         "STEP open_submitted client_order_index={open_index} tx_hash={}",
         open_receipt.ack.tx_hash
@@ -118,15 +133,18 @@ async fn run() -> Result<()> {
     let close_index = ((open_index + 1) & CLIENT_ORDER_INDEX_MAX).max(1);
     let close_id = format!("lighter-smoke-close-{close_index}");
     client.restore_order_tracking(&close_id, close_index)?;
-    let close_receipt = client
-        .submit_order(&market_order(
+    let close_receipt = submit_order(
+        &client,
+        market_order(
             &close_id,
             close_index,
             -open_fill.quantity,
             close_bid * Decimal::new(99, 2),
             true,
-        ))
-        .await?;
+        ),
+        use_ws_submission,
+    )
+    .await?;
     println!(
         "STEP close_submitted client_order_index={close_index} tx_hash={}",
         close_receipt.ack.tx_hash
@@ -144,7 +162,8 @@ async fn run() -> Result<()> {
         close_fill.quantity, close_fill.average_price, close_fill.fee, close_fill.position
     );
     println!(
-        "PASS lighter_live_smoke public_price=true private_fill=true position_ws=true auto_closed=true"
+        "PASS lighter_live_smoke transport={} public_price=true private_fill=true position_ws=true auto_closed=true",
+        if use_ws_submission { "ws" } else { "http" }
     );
     Ok(())
 }
@@ -157,6 +176,28 @@ fn require_confirmation() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn require_ws_transport_confirmation() -> Result<()> {
+    let confirmation = env::var("LIGHTER_LIVE_SMOKE_TRANSPORT").unwrap_or_default();
+    if confirmation != WS_TRANSPORT_CONFIRMATION {
+        bail!(
+            "WS order entry blocked: set LIGHTER_LIVE_SMOKE_TRANSPORT={WS_TRANSPORT_CONFIRMATION} together with LIGHTER_LIVE_SMOKE_CONFIRM to authorize the WS smoke path"
+        );
+    }
+    Ok(())
+}
+
+async fn submit_order(
+    client: &LighterExecutionClient,
+    request: LighterOrderRequest,
+    use_ws_submission: bool,
+) -> Result<bybot_lighter::execution_client::LighterSubmitReceipt> {
+    if use_ws_submission {
+        client.submit_order_ws(&request).await
+    } else {
+        client.submit_order(&request).await
+    }
 }
 
 async fn load_btc_market(http_url: &str) -> Result<LighterMarketSpec> {

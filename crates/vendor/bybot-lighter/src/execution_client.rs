@@ -2,13 +2,13 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context, Result};
 use rust_decimal::Decimal;
 use tokio::{
-    sync::{broadcast, watch},
+    sync::{broadcast, watch, Mutex as AsyncMutex},
     task::JoinHandle,
 };
 
@@ -22,6 +22,7 @@ use crate::{
     scaling::{scale_base_amount, scale_price, NonceManager},
     signer::LighterSigner,
     websocket::{LighterWebSocketClient, LighterWebSocketConfig, LighterWsEvent},
+    ws_submit::{LighterWsSubmitError, LighterWsSubmitter},
 };
 
 const AUTH_TOKEN_TTL_SECS: i64 = 600;
@@ -45,6 +46,17 @@ impl fmt::Display for LighterOrderRejected {
 }
 
 impl std::error::Error for LighterOrderRejected {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LighterOrderOutcomeUnknown(pub String);
+
+impl fmt::Display for LighterOrderOutcomeUnknown {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Lighter order outcome is unknown: {}", self.0)
+    }
+}
+
+impl std::error::Error for LighterOrderOutcomeUnknown {}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct LighterExecutionConfig {
@@ -139,6 +151,15 @@ pub struct LighterPreparedOrder {
 pub struct LighterSubmitReceipt {
     pub ack: LighterSubmitAck,
     pub effects: Vec<LighterExecutionEffect>,
+    pub timing: LighterSubmitTiming,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LighterSubmitTiming {
+    pub submit_started_at_ms: u64,
+    pub sign_ms: u64,
+    pub send_ms: u64,
+    pub ack_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +173,8 @@ struct LighterExecutionInner {
     http: LighterHttpClient,
     signer: LighterSigner,
     nonce: NonceManager,
+    submission_lock: AsyncMutex<()>,
+    ws_submitter: AsyncMutex<Option<LighterWsSubmitter>>,
     markets: BTreeMap<String, LighterMarketSpec>,
     reducer: Mutex<LighterExecutionReducer>,
     order_indices: Mutex<HashMap<u64, u64>>,
@@ -270,6 +293,8 @@ impl LighterExecutionClient {
                 http,
                 signer,
                 nonce: NonceManager::new(),
+                submission_lock: AsyncMutex::new(()),
+                ws_submitter: AsyncMutex::new(None),
                 markets,
                 reducer: Mutex::new(LighterExecutionReducer::new(drain_window_ms)),
                 order_indices: Mutex::new(HashMap::new()),
@@ -290,16 +315,64 @@ impl LighterExecutionClient {
     }
 
     pub async fn initialize(&self) -> Result<()> {
-        let next_nonce = self
-            .inner
+        let next_nonce = self.fetch_next_nonce().await?;
+        self.seed_nonce(next_nonce);
+        Ok(())
+    }
+
+    async fn fetch_next_nonce(&self) -> Result<i64> {
+        self.inner
             .http
             .next_nonce(
                 self.inner.config.account_index,
                 self.inner.config.api_key_index,
             )
-            .await?;
-        self.seed_nonce(next_nonce);
+            .await
+    }
+
+    async fn resynchronize_nonce(&self) -> Result<i64> {
+        let next_nonce = self.fetch_next_nonce().await?;
+        self.inner.nonce.resynchronize(next_nonce);
+        Ok(next_nonce)
+    }
+
+    /// Opens the opt-in, dedicated WebSocket `jsonapi/sendtx` connection.
+    /// HTTP remains the default submission transport until a caller uses one of
+    /// the explicit `*_ws` methods below.
+    pub async fn enable_ws_submission(&self) -> Result<()> {
+        if self.inner.ws_submitter.lock().await.is_some() {
+            return Ok(());
+        }
+        let submitter = LighterWsSubmitter::connect(LighterWebSocketConfig::new(
+            self.inner.config.private_ws_url.clone(),
+        )?)
+        .await?;
+        let mut guard = self.inner.ws_submitter.lock().await;
+        if guard.is_none() {
+            *guard = Some(submitter);
+        }
         Ok(())
+    }
+
+    async fn ws_submitter(&self) -> Result<LighterWsSubmitter> {
+        self.inner
+            .ws_submitter
+            .lock()
+            .await
+            .clone()
+            .context("Lighter WebSocket submission is not enabled")
+    }
+
+    async fn recover_ws_submission_failure(&self, submitter: &LighterWsSubmitter) -> String {
+        match self.resynchronize_nonce().await {
+            Ok(next_nonce) => match submitter.confirm_nonce_resynchronized().await {
+                Ok(()) => format!("; nonce resynchronized to {next_nonce}"),
+                Err(error) => format!(
+                    "; nonce resynchronized to {next_nonce}, but WS reconnect failed: {error}"
+                ),
+            },
+            Err(error) => format!("; nonce resynchronization failed: {error}"),
+        }
     }
 
     pub async fn account_snapshot(&self) -> Result<LighterAccountSnapshot> {
@@ -415,29 +488,128 @@ impl LighterExecutionClient {
         if !self.account_snapshot_ready() {
             bail!("Lighter account WebSocket snapshot is not ready");
         }
-        let prepared = self.prepare_order(request)?;
-        let ack = self
+        // Lighter requires one strictly sequential nonce stream per API key.
+        // This lock covers signing, submission, and any failure resynchronization.
+        let _submission = self.inner.submission_lock.lock().await;
+        let submit_started_at_ms = now_millis();
+        let sign_started = Instant::now();
+        let prepared = match self.prepare_order(request) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = self.resynchronize_nonce().await;
+                return Err(error);
+            }
+        };
+        let sign_ms = elapsed_millis(sign_started);
+        let (mut ack, transport_timing) = match self
             .inner
             .http
-            .submit_tx(&prepared.signed_tx)
+            .submit_tx_timed(&prepared.signed_tx)
             .await
-            .map_err(|error| {
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let resync = self.resynchronize_nonce().await;
+                let suffix = match resync {
+                    Ok(next_nonce) => format!("; nonce resynchronized to {next_nonce}"),
+                    Err(resync_error) => format!("; nonce resynchronization failed: {resync_error}"),
+                };
                 if error.code >= 0 {
-                    anyhow::Error::new(LighterOrderRejected(format!(
-                        "code={} message={}",
-                        error.code, error.message
-                    )))
-                } else {
-                    anyhow::anyhow!("Lighter submit transport failure: {}", error.message)
+                    return Err(anyhow::Error::new(LighterOrderRejected(format!(
+                        "code={} message={}{}",
+                        error.code, error.message, suffix
+                    ))));
                 }
-            })?;
+                return Err(anyhow::anyhow!(
+                    "Lighter submit transport failure: {}{}",
+                    error.message,
+                    suffix
+                ));
+            }
+        };
+        if ack.ts_event_ms == 0 {
+            ack.ts_event_ms = now_millis();
+        }
         let effects = self
             .inner
             .reducer
             .lock()
             .map_err(|_| anyhow::anyhow!("Lighter reducer lock poisoned"))?
             .on_submit_ack(ack.clone());
-        Ok(LighterSubmitReceipt { ack, effects })
+        Ok(LighterSubmitReceipt {
+            ack,
+            effects,
+            timing: LighterSubmitTiming {
+                submit_started_at_ms,
+                sign_ms,
+                send_ms: transport_timing.send_ms,
+                ack_ms: transport_timing.ack_ms,
+            },
+        })
+    }
+
+    /// Explicit WebSocket order path. It is not used by `submit_order` and
+    /// follows the same API-key lock and nonce recovery invariants as HTTP.
+    pub async fn submit_order_ws(
+        &self,
+        request: &LighterOrderRequest,
+    ) -> Result<LighterSubmitReceipt> {
+        if !self.account_snapshot_ready() {
+            bail!("Lighter account WebSocket snapshot is not ready");
+        }
+        let _submission = self.inner.submission_lock.lock().await;
+        // Fetch this before reserving a nonce: disabled WS entry must not
+        // consume a nonce or be mistaken for an ambiguous submission.
+        let submitter = self.ws_submitter().await?;
+        let submit_started_at_ms = now_millis();
+        let sign_started = Instant::now();
+        let prepared = match self.prepare_order(request) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = self.resynchronize_nonce().await;
+                return Err(error);
+            }
+        };
+        let sign_ms = elapsed_millis(sign_started);
+        let receipt = match submitter.submit_tx(&prepared.signed_tx).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let suffix = self.recover_ws_submission_failure(&submitter).await;
+                let message = format!("WebSocket submission failed: {error}{suffix}");
+                return match error {
+                    LighterWsSubmitError::Rejected { .. } => {
+                        Err(anyhow::Error::new(LighterOrderRejected(message)))
+                    }
+                    LighterWsSubmitError::OutcomeUnknown { .. }
+                    | LighterWsSubmitError::Protocol { .. }
+                    | LighterWsSubmitError::NonceResynchronizationRequired => {
+                        Err(anyhow::Error::new(LighterOrderOutcomeUnknown(message)))
+                    }
+                };
+            }
+        };
+        let ack = LighterSubmitAck {
+            client_order_id: prepared.client_order_id,
+            client_order_index: Some(prepared.client_order_index),
+            tx_hash: receipt.tx_hash,
+            ts_event_ms: receipt.ts_event_ms,
+        };
+        let effects = self
+            .inner
+            .reducer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Lighter reducer lock poisoned"))?
+            .on_submit_ack(ack.clone());
+        Ok(LighterSubmitReceipt {
+            ack,
+            effects,
+            timing: LighterSubmitTiming {
+                submit_started_at_ms,
+                sign_ms,
+                send_ms: receipt.timing.send_ms,
+                ack_ms: receipt.timing.ack_ms,
+            },
+        })
     }
 
     pub async fn cancel_order(
@@ -450,17 +622,24 @@ impl LighterExecutionClient {
         if !self.inner.nonce.is_seeded() {
             bail!("Lighter nonce is not seeded");
         }
+        let _submission = self.inner.submission_lock.lock().await;
         let market = self.market(&request.symbol)?;
         let market_index =
             i16::try_from(market.market_id).context("Lighter market id exceeds i16")?;
         let order_index =
             i64::try_from(request.order_index).context("Lighter order index exceeds i64")?;
         let nonce = self.inner.nonce.take();
-        let payload = self
+        let payload = match self
             .inner
             .signer
             .sign_cancel_order(market_index, order_index, nonce)
-            .map_err(|error| anyhow::anyhow!("Lighter cancel signing failed: {error}"))?;
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                let _ = self.resynchronize_nonce().await;
+                return Err(anyhow::anyhow!("Lighter cancel signing failed: {error}"));
+            }
+        };
         let tx = LighterSignedTx {
             client_order_id: request.client_order_id.clone(),
             client_order_index: request.client_order_index,
@@ -468,12 +647,82 @@ impl LighterExecutionClient {
             tx_info: payload.tx_info,
             price_protection: true,
         };
-        let ack = self
+        let ack = match self.inner.http.cancel_tx(&tx).await {
+            Ok(ack) => ack,
+            Err(error) => {
+                let suffix = match self.resynchronize_nonce().await {
+                    Ok(next_nonce) => format!("; nonce resynchronized to {next_nonce}"),
+                    Err(resync_error) => format!("; nonce resynchronization failed: {resync_error}"),
+                };
+                return Err(anyhow::anyhow!(
+                    "Lighter cancel rejected: code={} message={}{}",
+                    error.code,
+                    error.message,
+                    suffix
+                ));
+            }
+        };
+        let effects = self
             .inner
-            .http
-            .cancel_tx(&tx)
-            .await
-            .map_err(|error| anyhow::anyhow!("Lighter cancel rejected: {error:?}"))?;
+            .reducer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Lighter reducer lock poisoned"))?
+            .on_cancel_ack(ack.clone());
+        Ok(LighterCancelReceipt { ack, effects })
+    }
+
+    /// Explicit WebSocket cancellation path paired with `submit_order_ws`.
+    pub async fn cancel_order_ws(
+        &self,
+        request: &LighterCancelRequest,
+    ) -> Result<LighterCancelReceipt> {
+        if !self.account_snapshot_ready() {
+            bail!("Lighter account WebSocket snapshot is not ready");
+        }
+        if !self.inner.nonce.is_seeded() {
+            bail!("Lighter nonce is not seeded");
+        }
+        let _submission = self.inner.submission_lock.lock().await;
+        let market = self.market(&request.symbol)?;
+        let market_index =
+            i16::try_from(market.market_id).context("Lighter market id exceeds i16")?;
+        let order_index =
+            i64::try_from(request.order_index).context("Lighter order index exceeds i64")?;
+        let nonce = self.inner.nonce.take();
+        let payload = match self
+            .inner
+            .signer
+            .sign_cancel_order(market_index, order_index, nonce)
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                let _ = self.resynchronize_nonce().await;
+                return Err(anyhow::anyhow!("Lighter cancel signing failed: {error}"));
+            }
+        };
+        let tx = LighterSignedTx {
+            client_order_id: request.client_order_id.clone(),
+            client_order_index: request.client_order_index,
+            tx_type: payload.tx_type,
+            tx_info: payload.tx_info,
+            price_protection: true,
+        };
+        let submitter = self.ws_submitter().await?;
+        let receipt = match submitter.submit_tx(&tx).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let suffix = self.recover_ws_submission_failure(&submitter).await;
+                return Err(anyhow::anyhow!(
+                    "Lighter WebSocket cancel failed: {error}{suffix}"
+                ));
+            }
+        };
+        let ack = LighterCancelAck {
+            client_order_id: request.client_order_id.clone(),
+            client_order_index: request.client_order_index,
+            tx_hash: receipt.tx_hash,
+            ts_event_ms: receipt.ts_event_ms,
+        };
         let effects = self
             .inner
             .reducer
@@ -515,7 +764,7 @@ impl LighterExecutionClient {
                 }
                 LighterPrivateWsMessage::PositionSnapshot(positions) => {
                     account.positions = positions
-                        .into_iter()
+                        .iter()
                         .map(|position| {
                             (
                                 position.market_id,
@@ -523,26 +772,49 @@ impl LighterExecutionClient {
                                     market_id: position.market_id,
                                     signed_quantity: position.signed_quantity,
                                     average_price: position.average_price,
+                                    unrealized_pnl: position.unrealized_pnl,
+                                    return_on_equity: position.return_on_equity,
+                                    liquidation_price: position.liquidation_price,
                                 },
                             )
                         })
                         .collect();
+                    effects.extend(
+                        positions
+                            .into_iter()
+                            .map(|position| LighterExecutionEffect::Position { position }),
+                    );
                 }
                 LighterPrivateWsMessage::PositionUpdate(positions) => {
-                    for position in positions {
+                    for position in &positions {
                         account.positions.insert(
                             position.market_id,
                             LighterPositionSnapshot {
                                 market_id: position.market_id,
                                 signed_quantity: position.signed_quantity,
                                 average_price: position.average_price,
+                                unrealized_pnl: position.unrealized_pnl,
+                                return_on_equity: position.return_on_equity,
+                                liquidation_price: position.liquidation_price,
                             },
                         );
                     }
+                    effects.extend(
+                        positions
+                            .into_iter()
+                            .map(|position| LighterExecutionEffect::Position { position }),
+                    );
                 }
                 LighterPrivateWsMessage::AccountStats(stats) => {
                     account.collateral = Some(stats.collateral);
                     account.available_balance = Some(stats.available_balance);
+                }
+                LighterPrivateWsMessage::Funding(funding) => {
+                    effects.extend(
+                        funding
+                            .into_iter()
+                            .map(|funding| LighterExecutionEffect::Funding { funding }),
+                    );
                 }
                 LighterPrivateWsMessage::Ready(channel) => account.mark_ready(channel),
             }
@@ -551,6 +823,14 @@ impl LighterExecutionClient {
             self.inner.account_ready.send_replace(true);
         }
         Ok(effects)
+    }
+
+    pub fn flush_expired_external_trades(&self) -> Result<Vec<LighterExecutionEffect>> {
+        self.inner
+            .reducer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Lighter reducer lock poisoned"))
+            .map(|mut reducer| reducer.flush_expired_external_trades(now_millis()))
     }
 
     pub fn restore_order_tracking(
@@ -578,7 +858,10 @@ impl LighterExecutionClient {
     #[must_use]
     pub fn private_channels(&self) -> Vec<String> {
         let account_index = self.inner.config.account_index;
-        vec![format!("account_all_orders/{account_index}")]
+        vec![
+            format!("account_all_orders/{account_index}"),
+            format!("account_all/{account_index}"),
+        ]
     }
 
     #[must_use]
@@ -689,7 +972,9 @@ impl LighterExecutionClient {
         let task_sender = sender.clone();
         let task = tokio::spawn(async move {
             let mut heartbeat = tokio::time::interval(connection.heartbeat_interval());
+            let mut external_trade_flush = tokio::time::interval(Duration::from_millis(50));
             heartbeat.tick().await;
+            external_trade_flush.tick().await;
             loop {
                 tokio::select! {
                     _ = heartbeat.tick() => {
@@ -722,6 +1007,18 @@ impl LighterExecutionClient {
                                 }
                             }
                             Ok(LighterWsEvent::Reconnected) => {}
+                        }
+                    }
+                    _ = external_trade_flush.tick() => {
+                        match client.flush_expired_external_trades() {
+                            Ok(effects) => {
+                                for effect in effects {
+                                    let _ = task_sender.send(effect);
+                                }
+                            }
+                            Err(error) => client.record_account_stream_error(format!(
+                                "Lighter external-trade attribution flush failed: {error}"
+                            )),
                         }
                     }
                 }
@@ -815,4 +1112,17 @@ fn now_secs() -> i64 {
         .as_secs()
         .try_into()
         .unwrap_or(i64::MAX)
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn elapsed_millis(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

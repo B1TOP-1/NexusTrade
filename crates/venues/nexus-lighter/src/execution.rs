@@ -4,7 +4,7 @@
 //! 本层职责：类型转换、client_order_index 派生、订单状态机驱动、事件映射。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -12,7 +12,7 @@ use bybot_lighter::data::LighterMarketSpec;
 use bybot_lighter::execution::LighterExecutionEffect;
 use bybot_lighter::execution_client::{
     LighterCancelRequest, LighterExecutionClient, LighterExecutionConfig, LighterExecutionRuntime,
-    LighterOrderRequest, LighterOrderType, LighterTimeInForce,
+    LighterOrderOutcomeUnknown, LighterOrderRequest, LighterOrderType, LighterTimeInForce,
 };
 use bybot_lighter::http::LighterHttpClient;
 use nexus_core::{
@@ -72,6 +72,8 @@ pub struct LighterVenue {
     index_to_id: Arc<Mutex<HashMap<u64, String>>>,
     index_counter: AtomicU64,
     index_seed: u64,
+    /// HTTP remains the default until this is explicitly enabled by the caller.
+    ws_order_entry: AtomicBool,
     /// 私有流运行时：与 venue 同生命周期（Drop 即 abort 底层任务）。
     runtime: Mutex<Option<LighterExecutionRuntime>>,
 }
@@ -110,6 +112,7 @@ impl LighterVenue {
             index_to_id: Arc::new(Mutex::new(HashMap::new())),
             index_counter: AtomicU64::new(0),
             index_seed: config.index_seed,
+            ws_order_entry: AtomicBool::new(false),
             runtime: Mutex::new(None),
         })
     }
@@ -141,6 +144,21 @@ impl LighterVenue {
             .map(|s| Symbol::new(s.symbol.clone(), "USDC", s.symbol.clone()))
     }
 
+    /// Enables the separately connected, single-flight WS sendTx path.
+    /// This is an explicit opt-in and does not send an order by itself.
+    pub async fn enable_ws_order_entry(&self) -> Result<()> {
+        self.client
+            .enable_ws_submission()
+            .await
+            .map_err(|error| NexusError::Transport(format!("lighter WS submit connect: {error}")))?;
+        self.ws_order_entry.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn disable_ws_order_entry(&self) {
+        self.ws_order_entry.store(false, Ordering::Release);
+    }
+
     fn map_tif(order: &NewOrder) -> Result<LighterTimeInForce> {
         use nexus_core::Tif;
         match order.tif {
@@ -160,7 +178,7 @@ impl ExecutionVenue for LighterVenue {
 
     fn capabilities(&self) -> VenueCapabilities {
         VenueCapabilities {
-            ws_order_entry: false, // sendTx 走 HTTP，签名本地
+            ws_order_entry: self.ws_order_entry.load(Ordering::Acquire),
             batch_orders: false,
             post_only: true,
             reduce_only: true,
@@ -216,13 +234,24 @@ impl ExecutionVenue for LighterVenue {
                 .insert(client_order_index, order.client_id.0.clone());
         }
 
-        match self.client.submit_order(&request).await {
+        let submit_result = if self.ws_order_entry.load(Ordering::Acquire) {
+            self.client.submit_order_ws(&request).await
+        } else {
+            self.client.submit_order(&request).await
+        };
+        match submit_result {
             Ok(_receipt) => Ok(OrderAck {
                 client_id: order.client_id,
                 venue_order_id: None, // order_index 经私有流异步到达
             }),
             Err(e) => {
                 let msg = e.to_string();
+                if e.downcast_ref::<LighterOrderOutcomeUnknown>().is_some() {
+                    if let Some(entry) = self.registry.lock().unwrap().get_mut(&order.client_id.0) {
+                        let _ = entry.tracker.apply(OrderEvent::SubmitTimeout);
+                    }
+                    return Err(NexusError::Unknown(msg));
+                }
                 if let Some(entry) = self.registry.lock().unwrap().get_mut(&order.client_id.0) {
                     let _ = entry.tracker.apply(OrderEvent::Rejected {
                         reason: msg.clone(),
@@ -265,13 +294,23 @@ impl ExecutionVenue for LighterVenue {
             client_order_index: Some(client_order_index),
             order_index,
         };
-        self.client
-            .cancel_order(&request)
-            .await
+        let cancel_result = if self.ws_order_entry.load(Ordering::Acquire) {
+            self.client.cancel_order_ws(&request).await
+        } else {
+            self.client.cancel_order(&request).await
+        };
+        cancel_result
             .map(|_| ())
-            .map_err(|e| NexusError::VenueReject {
-                code: "LIGHTER_CANCEL".into(),
-                msg: e.to_string(),
+            .map_err(|e| {
+                let msg = e.to_string();
+                if e.downcast_ref::<LighterOrderOutcomeUnknown>().is_some() {
+                    NexusError::Unknown(msg)
+                } else {
+                    NexusError::VenueReject {
+                        code: "LIGHTER_CANCEL".into(),
+                        msg,
+                    }
+                }
             })
     }
 
@@ -316,10 +355,11 @@ impl PrivateVenue for LighterVenue {
         let (tx, rx) = mpsc::channel(4096);
         let registry = Arc::clone(&self.registry);
         let index_to_id = Arc::clone(&self.index_to_id);
+        let specs = self.specs.clone();
 
         tokio::spawn(async move {
             while let Ok(effect) = effects.recv().await {
-                for event in map_effect(&registry, &index_to_id, effect) {
+                for event in map_effect(&registry, &index_to_id, &specs, effect) {
                     if tx.send(event).await.is_err() {
                         return; // 订阅方已放弃
                     }
@@ -367,6 +407,7 @@ impl PrivateVenue for LighterVenue {
 fn map_effect(
     registry: &Registry,
     index_to_id: &Arc<Mutex<HashMap<u64, String>>>,
+    specs: &[LighterMarketSpec],
     effect: LighterExecutionEffect,
 ) -> Vec<AccountEvent> {
     let resolve_id = |cid: &str, coi: Option<u64>| -> Option<String> {
@@ -458,6 +499,12 @@ fn map_effect(
             }));
             events
         }
+        LighterExecutionEffect::Position { position } => position_effect(specs, position),
+        // These effects are intentionally retained in the vendor stream but do not
+        // have a lossless equivalent in nexus-core's AccountEvent yet.
+        LighterExecutionEffect::ExternalTrade { .. } | LighterExecutionEffect::Funding { .. } => {
+            Vec::new()
+        }
         LighterExecutionEffect::Canceled {
             client_order_id,
             client_order_index,
@@ -499,6 +546,26 @@ fn map_effect(
             .unwrap_or_default()
         }
     }
+}
+
+fn position_effect(
+    specs: &[LighterMarketSpec],
+    position: bybot_lighter::execution::LighterPrivatePositionEvent,
+) -> Vec<AccountEvent> {
+    let symbol = specs
+        .iter()
+        .find(|spec| spec.market_id == position.market_id)
+        .map(|spec| Symbol::new(spec.symbol.clone(), "USDC", spec.symbol.clone()));
+    symbol
+        .map(|symbol| {
+            vec![AccountEvent::PositionUpdate(Position {
+                symbol,
+                qty: position.signed_quantity,
+                entry_price: Some(position.average_price),
+                local_recv_ms: now_ms(),
+            })]
+        })
+        .unwrap_or_default()
 }
 
 /// 驱动状态机并产出 OrderUpdate。非法迁移（如迟到事件打在终态上）丢弃。

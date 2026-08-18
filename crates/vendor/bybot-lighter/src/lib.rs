@@ -6,3 +6,4 @@ pub mod local_book;
 pub mod scaling;
 pub mod signer;
 pub mod websocket;
+pub mod ws_submit;

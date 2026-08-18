@@ -1,4 +1,8 @@
-use std::{collections::HashMap, str::FromStr, time::Duration};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, StatusCode};
@@ -14,6 +18,7 @@ use crate::{
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const GET_MAX_ATTEMPTS: usize = 4;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -43,6 +48,17 @@ pub struct LighterPositionSnapshot {
     pub market_id: u64,
     pub signed_quantity: Decimal,
     pub average_price: Decimal,
+    pub unrealized_pnl: Option<Decimal>,
+    pub return_on_equity: Option<Decimal>,
+    pub liquidation_price: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LighterSubmitTransportTiming {
+    /// Time until the HTTP response headers are available.
+    pub send_ms: u64,
+    /// Time until the complete sendTx response body is available.
+    pub ack_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +79,7 @@ impl LighterHttpClient {
         let base_url = normalize_base_url(base_url)?;
         let client = Client::builder()
             .timeout(DEFAULT_TIMEOUT)
+            .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
             .user_agent("bybot-lighter/0.1")
             .build()
             .context("failed to build Lighter HTTP client")?;
@@ -133,8 +150,21 @@ impl LighterHttpClient {
         &self,
         tx: &LighterSignedTx,
     ) -> Result<LighterSubmitAck, LighterSendTxError> {
-        let payload = self.sendtx(tx).await?;
-        parse_lighter_submit_ack(&payload, tx.client_order_id.clone(), tx.client_order_index)
+        let (ack, _) = self.submit_tx_timed(tx).await?;
+        Ok(ack)
+    }
+
+    pub async fn submit_tx_timed(
+        &self,
+        tx: &LighterSignedTx,
+    ) -> Result<(LighterSubmitAck, LighterSubmitTransportTiming), LighterSendTxError> {
+        let (payload, timing) = self.sendtx_timed(tx).await?;
+        let ack = parse_lighter_submit_ack(
+            &payload,
+            tx.client_order_id.clone(),
+            tx.client_order_index,
+        )?;
+        Ok((ack, timing))
     }
 
     pub async fn cancel_tx(
@@ -146,6 +176,14 @@ impl LighterHttpClient {
     }
 
     async fn sendtx(&self, tx: &LighterSignedTx) -> Result<String, LighterSendTxError> {
+        Ok(self.sendtx_timed(tx).await?.0)
+    }
+
+    async fn sendtx_timed(
+        &self,
+        tx: &LighterSignedTx,
+    ) -> Result<(String, LighterSubmitTransportTiming), LighterSendTxError> {
+        let request_started = Instant::now();
         let response = self
             .client
             .post(self.sendtx_url())
@@ -153,15 +191,20 @@ impl LighterHttpClient {
             .send()
             .await
             .map_err(transport_error)?;
+        let send_ms = elapsed_millis(request_started);
         let status = response.status();
         let payload = response.text().await.map_err(transport_error)?;
+        let ack_ms = elapsed_millis(request_started);
         if !status.is_success() {
             return Err(LighterSendTxError {
                 code: i64::from(status.as_u16()),
                 message: sanitized_sendtx_error(status, &payload),
             });
         }
-        Ok(payload)
+        Ok((
+            payload,
+            LighterSubmitTransportTiming { send_ms, ack_ms },
+        ))
     }
 
     async fn get_text(&self, url: String) -> Result<String> {
@@ -194,6 +237,10 @@ impl LighterHttpClient {
     fn endpoint(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
+}
+
+fn elapsed_millis(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn sanitized_sendtx_error(status: StatusCode, payload: &str) -> String {
@@ -274,6 +321,17 @@ fn parse_position_snapshot(value: &Value) -> Result<LighterPositionSnapshot> {
         market_id,
         signed_quantity,
         average_price: decimal_field(value, "avg_entry_price")?,
+        unrealized_pnl: optional_decimal_field(value, "unrealized_pnl"),
+        return_on_equity: optional_decimal_field(value, "return_on_equity"),
+        liquidation_price: optional_decimal_field(value, "liquidation_price"),
+    })
+}
+
+fn optional_decimal_field(value: &Value, field: &str) -> Option<Decimal> {
+    value.get(field).and_then(|value| match value {
+        Value::String(text) => text.parse().ok(),
+        Value::Number(number) => number.to_string().parse().ok(),
+        _ => None,
     })
 }
 

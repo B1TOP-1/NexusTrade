@@ -94,7 +94,10 @@ fn account_channels_use_auth_only_when_required() {
     let client = client();
     assert_eq!(
         client.private_channels(),
-        vec!["account_all_orders/42".to_string()]
+        vec![
+            "account_all_orders/42".to_string(),
+            "account_all/42".to_string(),
+        ]
     );
     assert_eq!(
         client.public_account_channels(),

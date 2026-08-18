@@ -93,6 +93,16 @@ impl NonceManager {
         self.next.fetch_max(server_next, Ordering::AcqRel);
     }
 
+    /// Replaces the local value with the authoritative server nonce.
+    ///
+    /// Callers must first serialize all transactions for this API key. This is
+    /// used after a failed request, when the rejected transaction may not have
+    /// consumed its locally allocated nonce.
+    pub fn resynchronize(&self, server_next: i64) {
+        self.seeded.store(1, Ordering::Release);
+        self.next.store(server_next, Ordering::Release);
+    }
+
     /// Returns whether the manager has been seeded from the server at least once.
     #[must_use]
     pub fn is_seeded(&self) -> bool {
@@ -170,5 +180,10 @@ mod tests {
         // A fresh higher server value jumps the counter forward.
         nm.reset(500);
         assert_eq!(nm.take(), 500);
+
+        // Failure recovery uses the authoritative exchange value, which may
+        // legitimately be lower than a nonce reserved locally.
+        nm.resynchronize(99);
+        assert_eq!(nm.peek(), 99);
     }
 }

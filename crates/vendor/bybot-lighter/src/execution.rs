@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use anyhow::Context;
 use rust_decimal::Decimal;
 use serde_json::Value;
 
@@ -40,10 +41,14 @@ pub struct LighterPrivateOrderEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LighterPrivateTradeEvent {
     pub trade_id: String,
+    pub market_id: Option<u64>,
     /// Client order index of the bid side (`bid_client_id`).
     pub bid_client_index: Option<u64>,
     /// Client order index of the ask side (`ask_client_id`).
     pub ask_client_index: Option<u64>,
+    pub side: Option<String>,
+    pub bid_account_index: Option<u64>,
+    pub ask_account_index: Option<u64>,
     /// Fill base size as a decimal string (e.g. "0.00020").
     pub size: String,
     /// Fill price as a decimal string (e.g. "61150.7").
@@ -57,12 +62,27 @@ pub struct LighterPrivatePositionEvent {
     pub market_id: u64,
     pub signed_quantity: Decimal,
     pub average_price: Decimal,
+    pub unrealized_pnl: Option<Decimal>,
+    pub return_on_equity: Option<Decimal>,
+    pub liquidation_price: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LighterPrivateAccountStatsEvent {
     pub collateral: Decimal,
     pub available_balance: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LighterPositionFundingEvent {
+    pub timestamp_ms: u64,
+    pub market_id: u64,
+    pub funding_id: u64,
+    pub change: Decimal,
+    pub rate: Decimal,
+    pub position_size: Decimal,
+    pub position_side: String,
+    pub discount: Decimal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +254,12 @@ pub enum LighterExecutionEffect {
         synthetic: bool,
         ts_event_ms: u64,
     },
+    ExternalTrade {
+        trade: LighterPrivateTradeEvent,
+    },
+    Position {
+        position: LighterPrivatePositionEvent,
+    },
     Canceled {
         client_order_id: String,
         client_order_index: Option<u64>,
@@ -246,6 +272,9 @@ pub enum LighterExecutionEffect {
         reason: String,
         ts_event_ms: u64,
     },
+    Funding {
+        funding: LighterPositionFundingEvent,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +284,7 @@ pub enum LighterPrivateWsMessage {
     PositionSnapshot(Vec<LighterPrivatePositionEvent>),
     PositionUpdate(Vec<LighterPrivatePositionEvent>),
     AccountStats(LighterPrivateAccountStatsEvent),
+    Funding(Vec<LighterPositionFundingEvent>),
     Ready(LighterAccountChannel),
 }
 
@@ -309,6 +339,26 @@ fn collect_event_items(value: &Value) -> Vec<&Value> {
     }
 }
 
+fn collect_trade_items(value: &Value) -> Vec<(&Value, Option<u64>)> {
+    match value {
+        Value::Array(items) => items.iter().map(|item| (item, None)).collect(),
+        Value::Object(map) => map
+            .iter()
+            .flat_map(|(key, value)| {
+                let market_id = key.parse::<u64>().ok();
+                match value {
+                    Value::Array(items) => items
+                        .iter()
+                        .map(move |item| (item, market_id))
+                        .collect::<Vec<_>>(),
+                    other => vec![(other, market_id)],
+                }
+            })
+            .collect(),
+        other => vec![(other, None)],
+    }
+}
+
 /// Parses a Lighter private WS message into zero or more order/trade events.
 ///
 /// Real Lighter pushes carry arrays under `orders` / `trades` (e.g. message type
@@ -331,42 +381,50 @@ pub fn parse_lighter_private_ws_messages(
         );
     }
     let mut out = Vec::new();
+    let is_account_all = matches!(
+        message_type.as_str(),
+        "subscribed/account_all" | "update/account_all"
+    );
 
     // Lighter groups `orders`/`trades` by market index: {"1": [ ... ]}. Also
     // accept a flat array or a singular `order`/`trade` object.
-    if let Some(orders) = value.get("orders") {
-        for item in collect_event_items(orders) {
+    if !is_account_all {
+        if let Some(orders) = value.get("orders") {
+            for item in collect_event_items(orders) {
+                out.push(LighterPrivateWsMessage::Order(parse_private_order_event(
+                    item,
+                )?));
+            }
+        } else if let Some(item) = value.get("order") {
             out.push(LighterPrivateWsMessage::Order(parse_private_order_event(
                 item,
             )?));
         }
-    } else if let Some(item) = value.get("order") {
-        out.push(LighterPrivateWsMessage::Order(parse_private_order_event(
-            item,
-        )?));
-    }
 
-    if let Some(trades) = value.get("trades") {
-        for item in collect_event_items(trades) {
+        if let Some(trades) = value.get("trades") {
+            for (item, market_id_hint) in collect_trade_items(trades) {
+                out.push(LighterPrivateWsMessage::Trade(parse_private_trade_event(
+                    item,
+                    market_id_hint,
+                )?));
+            }
+        } else if let Some(item) = value.get("trade") {
             out.push(LighterPrivateWsMessage::Trade(parse_private_trade_event(
                 item,
+                None,
             )?));
         }
-    } else if let Some(item) = value.get("trade") {
-        out.push(LighterPrivateWsMessage::Trade(parse_private_trade_event(
-            item,
-        )?));
-    }
 
-    if let Some(positions) = value.get("positions") {
-        let positions = collect_event_items(positions)
-            .into_iter()
-            .map(parse_private_position_event)
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        if message_type == "update/account_all_positions" {
-            out.push(LighterPrivateWsMessage::PositionUpdate(positions));
-        } else {
-            out.push(LighterPrivateWsMessage::PositionSnapshot(positions));
+        if let Some(positions) = value.get("positions") {
+            let positions = collect_event_items(positions)
+                .into_iter()
+                .map(parse_private_position_event)
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if message_type == "update/account_all_positions" {
+                out.push(LighterPrivateWsMessage::PositionUpdate(positions));
+            } else {
+                out.push(LighterPrivateWsMessage::PositionSnapshot(positions));
+            }
         }
     }
 
@@ -374,6 +432,21 @@ pub fn parse_lighter_private_ws_messages(
         out.push(LighterPrivateWsMessage::AccountStats(
             parse_private_account_stats_event(stats)?,
         ));
+    }
+
+    let funding_histories = value.get("funding_histories").or_else(|| {
+        value
+            .get("data")
+            .and_then(|data| data.get("funding_histories"))
+    });
+    if let Some(funding_histories) = funding_histories {
+        let funding = collect_event_items(funding_histories)
+            .into_iter()
+            .map(parse_private_position_funding_event)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if !funding.is_empty() {
+            out.push(LighterPrivateWsMessage::Funding(funding));
+        }
     }
 
     // Fallback: a `data` envelope (array or object) tagged by channel/type.
@@ -393,6 +466,7 @@ pub fn parse_lighter_private_ws_messages(
                 } else if channel.contains("account_all_trades") {
                     out.push(LighterPrivateWsMessage::Trade(parse_private_trade_event(
                         item,
+                        None,
                     )?));
                 }
             }
@@ -438,8 +512,38 @@ fn parse_private_order_event(value: &Value) -> anyhow::Result<LighterPrivateOrde
     })
 }
 
-fn parse_private_trade_event(value: &Value) -> anyhow::Result<LighterPrivateTradeEvent> {
+fn parse_private_position_funding_event(
+    value: &Value,
+) -> anyhow::Result<LighterPositionFundingEvent> {
+    Ok(LighterPositionFundingEvent {
+        timestamp_ms: normalize_epoch_millis(
+            u64_field(value, &["timestamp"])?
+                .context("funding missing timestamp")?,
+        ),
+        market_id: u64_field(value, &["market_id", "marketId"])?
+            .context("funding missing market_id")?,
+        funding_id: u64_field(value, &["funding_id", "fundingId"])?
+            .context("funding missing funding_id")?,
+        change: decimal_field(value, &["change"] )?,
+        rate: decimal_field(value, &["rate"] )?,
+        position_size: decimal_field(value, &["position_size", "positionSize"] )?,
+        position_side: required_string_field(value, &["position_side", "positionSide"] )?,
+        discount: match value.get("discount") {
+            Some(_) => decimal_field(value, &["discount"] )?,
+            None => Decimal::ZERO,
+        },
+    })
+}
+
+fn parse_private_trade_event(
+    value: &Value,
+    market_id_hint: Option<u64>,
+) -> anyhow::Result<LighterPrivateTradeEvent> {
     Ok(LighterPrivateTradeEvent {
+        market_id: u64_field(value, &["market_id", "marketId"])
+            .ok()
+            .flatten()
+            .or(market_id_hint),
         trade_id: required_string_field(value, &["trade_id_str", "trade_id", "tradeId", "id"])?,
         // The trade carries both sides' client order indexes; the reducer matches
         // whichever one belongs to a tracked order.
@@ -449,15 +553,19 @@ fn parse_private_trade_event(value: &Value) -> anyhow::Result<LighterPrivateTrad
         ask_client_index: u64_field(value, &["ask_client_id", "ask_client_id_str"])
             .ok()
             .flatten(),
+        side: string_field(value, &["side", "order_side"]),
+        bid_account_index: u64_field(value, &["bid_account_id", "bid_account_index"])
+            .ok()
+            .flatten(),
+        ask_account_index: u64_field(value, &["ask_account_id", "ask_account_index"])
+            .ok()
+            .flatten(),
         // Decimal strings; passed through to Quantity/Price as-is.
         size: string_field(value, &["size", "base_amount", "filled_base_amount"])
             .unwrap_or_default(),
         price: string_field(value, &["price", "px", "execution_price"]),
-        // Lighter reports `maker_fee` (integer); taker fee not separately provided.
-        fee: i64_field(value, &["taker_fee", "maker_fee", "fee"])
-            .ok()
-            .flatten()
-            .unwrap_or(0),
+        // `maker_fee` belongs to the counterparty when this account takes.
+        fee: i64_field(value, &["taker_fee"]).ok().flatten().unwrap_or(0),
         ts_event_ms: normalize_epoch_millis(
             u64_field(value, &["transaction_time", "timestamp", "ts", "time"])
                 .ok()
@@ -477,6 +585,17 @@ fn parse_private_position_event(value: &Value) -> anyhow::Result<LighterPrivateP
         signed_quantity,
         average_price: decimal_field(value, &["avg_entry_price", "average_price"])
             .unwrap_or(Decimal::ZERO),
+        unrealized_pnl: optional_decimal_field(value, "unrealized_pnl"),
+        return_on_equity: optional_decimal_field(value, "return_on_equity"),
+        liquidation_price: optional_decimal_field(value, "liquidation_price"),
+    })
+}
+
+fn optional_decimal_field(value: &Value, field: &str) -> Option<Decimal> {
+    value.get(field).and_then(|value| match value {
+        Value::String(text) => text.parse().ok(),
+        Value::Number(number) => number.to_string().parse().ok(),
+        _ => None,
     })
 }
 
@@ -552,6 +671,7 @@ pub struct LighterExecutionReducer {
     ids_by_index: HashMap<u64, String>,
     pending_order_events_by_index: HashMap<u64, Vec<LighterPrivateOrderEvent>>,
     pending_trade_events_by_index: HashMap<u64, Vec<LighterPrivateTradeEvent>>,
+    pending_trade_received_at: HashMap<String, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -609,6 +729,7 @@ impl LighterExecutionReducer {
             }
             if let Some(events) = self.pending_trade_events_by_index.remove(&index) {
                 for event in events {
+                    self.remove_pending_trade(&event.trade_id);
                     effects.extend(self.apply_trade_event(&ack.client_order_id, event));
                 }
             }
@@ -663,6 +784,9 @@ impl LighterExecutionReducer {
 
         // Not yet mapped (trade before submit ack): either side may be ours, so
         // retain the event under both distinct client indexes for later replay.
+        self.pending_trade_received_at
+            .entry(event.trade_id.clone())
+            .or_insert(event.ts_event_ms);
         if let Some(index) = event.bid_client_index {
             self.pending_trade_events_by_index
                 .entry(index)
@@ -679,6 +803,45 @@ impl LighterExecutionReducer {
                 .push(event);
         }
         Vec::new()
+    }
+
+    pub fn flush_expired_external_trades(
+        &mut self,
+        now_event_ms: u64,
+    ) -> Vec<LighterExecutionEffect> {
+        let expired = self
+            .pending_trade_received_at
+            .iter()
+            .filter(|(_, received_at)| {
+                now_event_ms.saturating_sub(**received_at) >= self.drain_window_ms
+            })
+            .map(|(trade_id, _)| trade_id.clone())
+            .collect::<Vec<_>>();
+        let mut effects = Vec::new();
+        for trade_id in expired {
+            self.pending_trade_received_at.remove(&trade_id);
+            let mut trade = None;
+            for pending in self.pending_trade_events_by_index.values_mut() {
+                if trade.is_none() {
+                    trade = pending
+                        .iter()
+                        .find(|event| event.trade_id == trade_id)
+                        .cloned();
+                }
+                pending.retain(|event| event.trade_id != trade_id);
+            }
+            if let Some(trade) = trade {
+                effects.push(LighterExecutionEffect::ExternalTrade { trade });
+            }
+        }
+        effects
+    }
+
+    fn remove_pending_trade(&mut self, trade_id: &str) {
+        self.pending_trade_received_at.remove(trade_id);
+        for pending in self.pending_trade_events_by_index.values_mut() {
+            pending.retain(|event| event.trade_id != trade_id);
+        }
     }
 
     pub fn on_cancel_ack(&mut self, ack: LighterCancelAck) -> Vec<LighterExecutionEffect> {
@@ -715,6 +878,7 @@ impl LighterExecutionReducer {
                 LighterPrivateWsMessage::PositionSnapshot(_)
                 | LighterPrivateWsMessage::PositionUpdate(_)
                 | LighterPrivateWsMessage::AccountStats(_)
+                | LighterPrivateWsMessage::Funding(_)
                 | LighterPrivateWsMessage::Ready(_) => {}
             }
         }

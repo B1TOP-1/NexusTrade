@@ -478,6 +478,12 @@ fn effect_json(effect: LighterExecutionEffect) -> Value {
         } => {
             json!({"type":"execution","kind":"fill","client_order_id":client_order_id,"client_order_index":client_order_index,"trade_id":trade_id,"quantity":quantity,"price":price,"fee":fee,"synthetic":synthetic,"ts_event_ms":ts_event_ms})
         }
+        LighterExecutionEffect::ExternalTrade { trade } => {
+            json!({"type":"execution","kind":"external_trade","trade_id":trade.trade_id,"market_id":trade.market_id,"ts_event_ms":trade.ts_event_ms})
+        }
+        LighterExecutionEffect::Position { position } => {
+            json!({"type":"execution","kind":"position","market_id":position.market_id,"quantity":position.signed_quantity,"average_price":position.average_price})
+        }
         LighterExecutionEffect::Canceled {
             client_order_id,
             client_order_index,
@@ -493,6 +499,9 @@ fn effect_json(effect: LighterExecutionEffect) -> Value {
             ts_event_ms,
         } => {
             json!({"type":"execution","kind":"rejected","client_order_id":client_order_id,"client_order_index":client_order_index,"reason":reason,"ts_event_ms":ts_event_ms})
+        }
+        LighterExecutionEffect::Funding { funding } => {
+            json!({"type":"execution","kind":"funding","market_id":funding.market_id,"funding_id":funding.funding_id,"change":funding.change,"timestamp_ms":funding.timestamp_ms})
         }
     }
 }
